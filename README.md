@@ -10,8 +10,7 @@ git clone git@github.com:yezhan14promax/adaptive-zoning-des.git
 cd adaptive-zoning-des
 python -m venv .venv
 . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt  # if present
-```
+pip install -r requirements.txt  
 
 ## Research Summary 
 We study how **centralized aggregation** and **static zoning** create hotspots and overload under scale and skew.
@@ -42,7 +41,7 @@ git clone git@github.com:yezhan14promax/adaptive-zoning-des.git
 cd adaptive-zoning-des
 python -m venv .venv
 . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt  # si présent
+pip install -r requirements.txt 
 ```
 
 ## Résumé scientifique 
@@ -74,7 +73,7 @@ git clone git@github.com:yezhan14promax/adaptive-zoning-des.git
 cd adaptive-zoning-des
 python -m venv .venv
 . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt  # 若存在
+pip install -r requirements.txt 
 ```
 
 ## 研究摘要 
