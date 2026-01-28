@@ -1,0 +1,10 @@
+# outputs
+outputs/
+outputs/**
+
+# generated artifacts
+mnt/data/
+
+# python cache
+__pycache__/
+*.pyc
