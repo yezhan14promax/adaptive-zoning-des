@@ -3,6 +3,7 @@ import math
 import os
 
 from arm_sim.experiments.run_hotspot import run_scheme
+from arm_sim.experiments.output_utils import normalize_output_root
 
 
 HOT_START = 30.0
@@ -203,7 +204,7 @@ def _summary_complete_scaled(rows, expected_keys):
 
 def run_scalability_experiment(output_dir=None):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    output_dir = output_dir or os.path.join(base_dir, "outputs")
+    output_dir = normalize_output_root(base_dir, output_dir, prefix="figure")
     figures_dir = os.path.join(output_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
 
@@ -378,7 +379,7 @@ def _expected_scaled_tag(n_zones):
 
 def run_scaled_load_experiment(output_dir=None):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    output_dir = output_dir or os.path.join(base_dir, "outputs")
+    output_dir = normalize_output_root(base_dir, output_dir, prefix="figure")
     figures_dir = os.path.join(output_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
 

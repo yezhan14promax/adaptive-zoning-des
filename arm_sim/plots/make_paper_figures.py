@@ -6,6 +6,8 @@ import random
 import shutil
 import time
 
+from arm_sim.experiments.output_utils import normalize_output_root
+
 
 SUMMARY_REQUIRED_BASE_COLUMNS = {
     "tag",
@@ -13,7 +15,7 @@ SUMMARY_REQUIRED_BASE_COLUMNS = {
     "hotspot_p95_mean_ms",
     "hotspot_mean_ms",
 }
-SUMMARY_OVERLOAD_COLUMNS = ("overload_ratio_q1000", "overload_ratio")
+SUMMARY_OVERLOAD_COLUMNS = ("fixed_hotspot_overload_ratio_q1000", "overload_ratio_q1000", "overload_ratio")
 SUMMARY_MIGRATED_COLUMNS = ("migrated_weight_total", "migrated_robots_total")
 DEFAULT_KNEE_WEIGHT = 0.5
 DEFAULT_LAMBDA_SWEEP = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
@@ -86,9 +88,9 @@ def _is_nan(value):
 
 
 def _cost_value(row):
-    value = row.get("cost_per_request")
+    value = row.get("migrated_weight_total")
     if value is None or _is_nan(value):
-        value = row.get("migrated_weight_total")
+        value = row.get("cost_per_request")
     return value
 
 
@@ -285,7 +287,11 @@ def _overload_ratio(rows, key, label):
 
 
 def _overload_ratio_q1000(rows):
-    return _overload_ratio(rows, "overload_ratio_q1000", "overload_ratio_q1000")
+    return _overload_ratio(
+        rows,
+        "fixed_hotspot_overload_ratio_q1000",
+        "overload_ratio_q1000",
+    )
 
 
 def _save_figure(fig, png_path):
@@ -644,7 +650,7 @@ def _plot_fig3(fig_path, points, offset_log=None):
     from matplotlib.transforms import Bbox
 
     fig, ax = plt.subplots(figsize=(7.5, 5.0), constrained_layout=True)
-    ax.set_xlabel("Reconfiguration cost per request", fontsize=12)
+    ax.set_xlabel("Reconfiguration cost (total migrated load)", fontsize=12)
     ax.set_ylabel("Overload ratio (queue > 1000)", fontsize=12)
     ax.tick_params(labelsize=11)
 
@@ -1617,6 +1623,12 @@ def _parse_args():
         action="store_true",
         help="Plot figures from existing summary CSVs without running simulations.",
     )
+    parser.add_argument("--output_root", default=None)
+    parser.add_argument(
+        "--from_snapshot_dir",
+        default=None,
+        help="Read summary CSVs from a snapshot directory and plot without running simulations.",
+    )
     return parser.parse_args()
 
 
@@ -1645,11 +1657,7 @@ def _resolve_mnt_dir(base_dir):
     env_dir = os.getenv("MNT_DATA_DIR")
     if env_dir:
         return env_dir
-    if os.path.basename(os.path.abspath(base_dir)) == "outputs":
-        base_dir = os.path.dirname(os.path.abspath(base_dir))
-    if os.path.isdir("/mnt/data"):
-        return "/mnt/data"
-    return os.path.join(base_dir, "mnt", "data")
+    return None
 
 
 def _resolve_timestamp_dir(base_dir):
@@ -1657,9 +1665,12 @@ def _resolve_timestamp_dir(base_dir):
     if env_dir:
         return env_dir
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    if os.path.basename(os.path.abspath(base_dir)) == "outputs":
-        return os.path.join(base_dir, f"figures_{stamp}")
-    return os.path.join(base_dir, "outputs", f"figures_{stamp}")
+    base_name = os.path.basename(os.path.abspath(base_dir))
+    if base_name.startswith("figure_"):
+        return base_dir
+    if base_name == "outputs":
+        return os.path.join(base_dir, f"figure_{stamp}")
+    return os.path.join(base_dir, "outputs", f"figure_{stamp}")
 
 
 def _copy_figures(outputs, base_dir, extra_files=None):
@@ -1668,8 +1679,7 @@ def _copy_figures(outputs, base_dir, extra_files=None):
         return None, None
     timestamp_dir = _resolve_timestamp_dir(base_dir)
     os.makedirs(timestamp_dir, exist_ok=True)
-    mnt_dir = _resolve_mnt_dir(base_dir)
-    os.makedirs(mnt_dir, exist_ok=True)
+    mnt_dir = None
 
     mapping = {}
     for path in pngs:
@@ -1694,9 +1704,7 @@ def _copy_figures(outputs, base_dir, extra_files=None):
         dst = os.path.join(timestamp_dir, os.path.basename(src))
         if os.path.abspath(src) != os.path.abspath(dst):
             shutil.copy2(src, dst)
-        fixed = fixed_names.get(key)
-        if fixed:
-            shutil.copy2(src, os.path.join(mnt_dir, fixed))
+        _ = fixed_names.get(key)
 
     for path in extra_files or []:
         if not path or not os.path.isfile(path):
@@ -1789,7 +1797,7 @@ def _plot_from_summaries(output_dir, figures_dir_main, figures_dir_fig4):
                 "N": row.get("N"),
                 "scheme": label,
                 "hotspot_p95_mean_ms": row.get("hotspot_p95_mean_ms"),
-                "overload_ratio_q1000": row.get("overload_ratio_q1000"),
+                "overload_ratio_q1000": row.get("fixed_hotspot_overload_ratio_q1000"),
             }
         )
     expected = {"Static-edge", "Ours-Lite", "Ours-Balanced", "Ours-Strong"}
@@ -1822,11 +1830,37 @@ def _plot_from_summaries(output_dir, figures_dir_main, figures_dir_fig4):
 def main():
     args = _parse_args()
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    output_dir = os.path.join(base_dir, "outputs")
+    output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
     figures_dir = os.path.join(output_dir, "figure_z16_noc")
     os.makedirs(figures_dir, exist_ok=True)
     figures_dir_fig4 = os.path.join(output_dir, "figures")
     os.makedirs(figures_dir_fig4, exist_ok=True)
+
+    if args.from_snapshot_dir:
+        snapshot_dir = os.path.abspath(args.from_snapshot_dir)
+        if not os.path.isdir(snapshot_dir):
+            raise FileNotFoundError(f"Snapshot directory not found: {snapshot_dir}")
+        summary_main_path = os.path.join(snapshot_dir, "summary_main_and_ablations.csv")
+        summary_fig4_path = os.path.join(snapshot_dir, "summary_fig4_scaledload.csv")
+        if not os.path.isfile(summary_main_path):
+            raise FileNotFoundError(f"Missing snapshot summary: {summary_main_path}")
+        if not os.path.isfile(summary_fig4_path):
+            raise FileNotFoundError(f"Missing snapshot summary: {summary_fig4_path}")
+
+        outputs = _plot_from_summaries(output_dir, snapshot_dir, snapshot_dir)
+        used_path = os.path.join(figures_dir_fig4, "snapshot_used.txt")
+        with open(used_path, "w", newline="") as handle:
+            handle.write(f"snapshot_dir={snapshot_dir}\n")
+            for path in (summary_main_path, summary_fig4_path):
+                stat = os.stat(path)
+                handle.write(
+                    f"{os.path.basename(path)} size={stat.st_size} mtime={int(stat.st_mtime)}\n"
+                )
+        print("Generated outputs from snapshot:")
+        for path in outputs:
+            print(path)
+        print(used_path)
+        return
 
     if args.plot_only:
         outputs = _plot_from_summaries(output_dir, figures_dir, figures_dir_fig4)
@@ -1997,13 +2031,22 @@ def main():
                 row, "hotspot_mean_ms", f"{main_tag} {scheme}", summary_main_path
             ),
             "overload_ratio_q500": _require_value(
-                row, "overload_ratio_q500", f"{main_tag} {scheme}", summary_main_path
+                row,
+                "fixed_hotspot_overload_ratio_q500",
+                f"{main_tag} {scheme}",
+                summary_main_path,
             ),
             "overload_ratio_q1000": _require_value(
-                row, "overload_ratio_q1000", f"{main_tag} {scheme}", summary_main_path
+                row,
+                "fixed_hotspot_overload_ratio_q1000",
+                f"{main_tag} {scheme}",
+                summary_main_path,
             ),
             "overload_ratio_q1500": _require_value(
-                row, "overload_ratio_q1500", f"{main_tag} {scheme}", summary_main_path
+                row,
+                "fixed_hotspot_overload_ratio_q1500",
+                f"{main_tag} {scheme}",
+                summary_main_path,
             ),
             "migrated_weight_total": _require_value(
                 row, "migrated_weight_total", f"{main_tag} {scheme}", summary_main_path
@@ -2030,16 +2073,25 @@ def main():
                     row, "hotspot_mean_ms", row.get("tag"), summary_profiles_path
                 ),
                 "overload_ratio_q500": _require_value(
-                    row, "overload_ratio_q500", row.get("tag"), summary_profiles_path
+                    row,
+                    "fixed_hotspot_overload_ratio_q500",
+                    row.get("tag"),
+                    summary_profiles_path,
                 ),
                 "migrated_weight_total": _require_value(
                     row, "migrated_weight_total", row.get("tag"), summary_profiles_path
                 ),
                 "overload_ratio_q1000": _require_value(
-                    row, "overload_ratio_q1000", row.get("tag"), summary_profiles_path
+                    row,
+                    "fixed_hotspot_overload_ratio_q1000",
+                    row.get("tag"),
+                    summary_profiles_path,
                 ),
                 "overload_ratio_q1500": _require_value(
-                    row, "overload_ratio_q1500", row.get("tag"), summary_profiles_path
+                    row,
+                    "fixed_hotspot_overload_ratio_q1500",
+                    row.get("tag"),
+                    summary_profiles_path,
                 ),
             }
         )

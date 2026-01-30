@@ -1,5 +1,8 @@
 import json
 import os
+import argparse
+
+from arm_sim.experiments.output_utils import normalize_output_root
 
 from arm_sim.experiments.run_hotspot import (
     _collect_seed_summary,
@@ -19,8 +22,12 @@ def _load_main_config(figures_dir):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_root", default=None)
+    args = parser.parse_args()
+
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    output_dir = os.path.join(base_dir, "outputs")
+    output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
     figures_dir = os.path.join(output_dir, "figure_z16_noc")
     os.makedirs(output_dir, exist_ok=True)
 

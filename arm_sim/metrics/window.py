@@ -104,37 +104,24 @@ def compute_window_kpis(
         if hotspot_zone_ids is not None:
             if home_zone is None or int(home_zone) not in hotspot_zone_ids:
                 continue
-        edge_done_time = record.get("edge_done_time")
-        if edge_done_time is None:
-            edge_done_time = record.get("zone_done")
-        central_done_time = record.get("central_done_time")
-        if central_done_time is None:
-            central_done_time = record.get("central_done")
-        final_done_time = record.get("final_done_time")
-        if final_done_time is None:
-            final_done_time = edge_done_time if edge_done_time is not None else central_done_time
-        if emit_time is not None:
-            emit_index = int(emit_time // window_s)
-            if emit_index >= num_windows:
-                emit_index = num_windows - 1
-            windows[emit_index]["generated"] += 1
-        if edge_done_time is not None:
-            zone_index = int(edge_done_time // window_s)
-            if zone_index >= num_windows:
-                zone_index = num_windows - 1
-            windows[zone_index]["edge_completed"] += 1
-        if central_done_time is not None:
-            central_index = int(central_done_time // window_s)
-            if central_index >= num_windows:
-                central_index = num_windows - 1
-            windows[central_index]["central_completed"] += 1
-        if emit_time is None or final_done_time is None:
+        arrive_zone = record.get("arrive_zone")
+        cohort_time = arrive_zone if arrive_zone is not None else emit_time
+        if cohort_time is None:
             continue
-        index = int(final_done_time // window_s)
+        final_done_time = record.get("final_done_time")
+        final_done_stage = record.get("final_done_stage")
+
+        index = int(cohort_time // window_s)
         if index >= num_windows:
             index = num_windows - 1
-        windows[index]["completed"] += 1
-        windows[index]["latencies"].append((final_done_time - emit_time) * 1000.0)
+        windows[index]["generated"] += 1
+        if final_done_time is not None:
+            windows[index]["completed"] += 1
+            if final_done_stage == "edge":
+                windows[index]["edge_completed"] += 1
+            elif final_done_stage == "central":
+                windows[index]["central_completed"] += 1
+            windows[index]["latencies"].append((final_done_time - cohort_time) * 1000.0)
 
     rows = []
     for i, window in enumerate(windows):

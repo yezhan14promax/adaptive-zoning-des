@@ -1,4 +1,7 @@
 import os
+import argparse
+
+from arm_sim.experiments.output_utils import normalize_output_root
 
 from arm_sim.experiments.run_hotspot import run_scheme
 
@@ -62,8 +65,12 @@ def _run(tag, scheme, dmax_ms, seed, output_dir, state_rate_hz, zone_rate, **kwa
 
 
 def main():
-    output_dir = os.path.join(os.path.dirname(__file__), "..", "..", "outputs")
-    output_dir = os.path.abspath(output_dir)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_root", default=None)
+    args = parser.parse_args()
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
 
     seed = 123
     state_rate_hz = 10

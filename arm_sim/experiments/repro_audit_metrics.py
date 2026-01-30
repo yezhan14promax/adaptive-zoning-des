@@ -1,7 +1,9 @@
 import os
 import csv
+import argparse
 
 from arm_sim.experiments import run_hotspot
+from arm_sim.experiments.output_utils import normalize_output_root
 
 
 def _mean(values):
@@ -56,11 +58,16 @@ def _print_debug_tail(debug_path, limit=20):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_root", default=None)
+    args = parser.parse_args()
+
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    output_dir = os.path.join(base_dir, "outputs", "figure_z16_noc")
+    output_root = normalize_output_root(base_dir, args.output_root, prefix="figure")
+    output_dir = os.path.join(output_root, "figure_z16_noc")
     os.makedirs(output_dir, exist_ok=True)
 
-    main_config = run_hotspot._load_main_run_config(os.path.join(base_dir, "outputs"), output_dir)
+    main_config = run_hotspot._load_main_run_config(output_root, output_dir)
     arrival = main_config["arrival"]
     service = main_config["service"]
     hotspot = main_config["hotspot"]
@@ -133,7 +140,14 @@ def main():
             int(float(row.get("global_generated", 0) or 0)) for row in rows
         )
         hotspot_generated = sum(
-            int(float(row.get("hotspot_generated_fixed", 0) or 0)) for row in rows
+            int(
+                float(
+                    row.get("fixed_hotspot_generated_requests")
+                    or row.get("hotspot_generated_fixed")
+                    or 0
+                )
+            )
+            for row in rows
         )
         migrated_weight_total = _parse_float(rows[0].get("migrated_weight_total")) or 0.0
         reconfig_action_count = _parse_float(rows[0].get("reconfig_action_count")) or 0.0
@@ -149,6 +163,25 @@ def main():
             reconfig_action_count / horizon_s if horizon_s > 0 else float("nan")
         )
         completion_ratio = _parse_float(rows[0].get("global_completion_ratio"))
+        fixed_completion_ratio = _parse_float(
+            rows[0].get("fixed_hotspot_completion_ratio")
+        )
+        if completion_ratio is not None and not (0.0 <= completion_ratio <= 1.0):
+            raise RuntimeError(
+                "Invalid global_completion_ratio "
+                f"{completion_ratio}; edge_completed={rows[0].get('edge_completed')}, "
+                f"central_completed={rows[0].get('central_completed')}, "
+                f"total_completed={rows[0].get('total_completed')}, "
+                f"completed={rows[0].get('completed')}"
+            )
+        if fixed_completion_ratio is not None and not (0.0 <= fixed_completion_ratio <= 1.0):
+            raise RuntimeError(
+                "Invalid fixed_hotspot_completion_ratio "
+                f"{fixed_completion_ratio}; edge_completed={rows[0].get('edge_completed')}, "
+                f"central_completed={rows[0].get('central_completed')}, "
+                f"total_completed={rows[0].get('total_completed')}, "
+                f"completed={rows[0].get('completed')}"
+            )
 
         summary_rows.append(
             {

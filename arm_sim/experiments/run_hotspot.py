@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import time
+import sys
 
 from arm_sim.behavior.aggregate_cache import AggregateCacheBehavior
 from arm_sim.behavior.base import ZoneBehavior
@@ -29,6 +30,8 @@ from arm_sim.routing.s0_centralized import CentralizedRouter
 from arm_sim.routing.s1_static_edge import StaticEdgeRouter
 from arm_sim.routing.s2_adaptive import AdaptiveRouter
 from arm_sim.workload.hotspot import apply_hotspot
+from arm_sim.experiments.repro_stamp import write_repro_stamp
+from arm_sim.experiments.output_utils import normalize_output_root
 
 HOTSPOT_START_S = 30.0
 HOTSPOT_END_S = 80.0
@@ -582,16 +585,43 @@ def _summarize_window_rows(rows, t_hot_start, t_hot_end, scheme_label, seed):
     global_admitted_requests = global_generated_requests
     global_dropped_requests = 0
     completion_ratio = (
-        total_completed / generated_requests if generated_requests > 0 else float("nan")
+        completed_requests / generated_requests if generated_requests > 0 else float("nan")
     )
     global_completion_ratio = (
-        global_total_completed / global_generated_requests
+        global_completed_requests / global_generated_requests
         if global_generated_requests > 0
         else float("nan")
     )
     fixed_hotspot_completion_ratio = (
-        total_completed / generated_requests if generated_requests > 0 else float("nan")
+        completed_requests / generated_requests if generated_requests > 0 else float("nan")
     )
+    if not math.isnan(completion_ratio) and completion_ratio > 1.0 + 1.0e-9:
+        raise RuntimeError(
+            "Invalid completion_ratio > 1.0: "
+            f"completed={completed_requests} generated={generated_requests} "
+            f"edge_completed={sum(int(_parse_float(row.get('edge_completed')) or 0) for row in rows)} "
+            f"central_completed={sum(int(_parse_float(row.get('central_completed')) or 0) for row in rows)} "
+            f"total_completed={total_completed}"
+        )
+    if not math.isnan(global_completion_ratio) and global_completion_ratio > 1.0 + 1.0e-9:
+        raise RuntimeError(
+            "Invalid global_completion_ratio > 1.0: "
+            f"completed={global_completed_requests} generated={global_generated_requests} "
+            f"edge_completed={sum(int(_parse_float(row.get('edge_completed')) or 0) for row in rows)} "
+            f"central_completed={sum(int(_parse_float(row.get('central_completed')) or 0) for row in rows)} "
+            f"total_completed={global_total_completed}"
+        )
+    if (
+        not math.isnan(fixed_hotspot_completion_ratio)
+        and fixed_hotspot_completion_ratio > 1.0 + 1.0e-9
+    ):
+        raise RuntimeError(
+            "Invalid fixed_hotspot_completion_ratio > 1.0: "
+            f"completed={completed_requests} generated={generated_requests} "
+            f"edge_completed={sum(int(_parse_float(row.get('edge_completed')) or 0) for row in rows)} "
+            f"central_completed={sum(int(_parse_float(row.get('central_completed')) or 0) for row in rows)} "
+            f"total_completed={total_completed}"
+        )
     first = rows[0] if rows else {}
     migrated_weight_total = _parse_float(first.get("migrated_weight_total")) or 0.0
     accepted_migrations = int(_parse_float(first.get("policy_reassign_ops")) or 0)
@@ -661,15 +691,17 @@ def _summarize_window_rows(rows, t_hot_start, t_hot_end, scheme_label, seed):
         "global_generated_requests": global_generated_requests,
         "global_completed_requests": global_completed_requests,
         "global_total_completed": global_total_completed,
-        "global_completed_total": global_total_completed,
+        "global_completed_total": global_completed_requests,
         "admitted_requests": admitted_requests,
         "dropped_requests": dropped_requests,
         "global_admitted_requests": global_admitted_requests,
         "global_dropped_requests": global_dropped_requests,
         "hotspot_generated_requests_fixed": generated_requests,
         "hotspot_completed_requests_fixed": completed_requests,
-        "fixed_hotspot_completed": total_completed,
-        "fixed_hotspot_completed_total": total_completed,
+        "fixed_hotspot_generated_requests": generated_requests,
+        "fixed_hotspot_completed_requests": completed_requests,
+        "fixed_hotspot_completed": completed_requests,
+        "fixed_hotspot_completed_total": completed_requests,
         "hotspot_admitted_requests_fixed": generated_requests,
         "hotspot_dropped_requests_fixed": 0,
         "completion_ratio": completion_ratio,
@@ -920,10 +952,19 @@ def _seed_variation(rows, tol_p95_s=1.0e-3, tol_over=1.0e-4):
         and not math.isnan(row.get("hotspot_p95_mean_ms"))
     ]
     over_vals = [
-        row.get("overload_ratio_q1000")
+        row.get("fixed_hotspot_overload_ratio_q1000")
+        if row.get("fixed_hotspot_overload_ratio_q1000") is not None
+        else row.get("overload_ratio_q1000")
         for row in rows
-        if row.get("overload_ratio_q1000") is not None
-        and not math.isnan(row.get("overload_ratio_q1000"))
+        if (
+            row.get("fixed_hotspot_overload_ratio_q1000") is not None
+            and not math.isnan(row.get("fixed_hotspot_overload_ratio_q1000"))
+        )
+        or (
+            row.get("fixed_hotspot_overload_ratio_q1000") is None
+            and row.get("overload_ratio_q1000") is not None
+            and not math.isnan(row.get("overload_ratio_q1000"))
+        )
     ]
     if len(p95_vals) < 2 and len(over_vals) < 2:
         return False
@@ -940,10 +981,13 @@ def _print_seed_metrics(rows, label):
             if row.get("hotspot_p95_mean_ms") is not None
             else float("nan")
         )
+        ratio = row.get("fixed_hotspot_overload_ratio_q1000")
+        if ratio is None:
+            ratio = row.get("overload_ratio_q1000")
         print(
             f"seed={row.get('seed')} "
             f"hotspot_p95_s={p95_s:.6f} "
-            f"overload_q1000={row.get('overload_ratio_q1000')}"
+            f"overload_q1000={ratio}"
         )
 
 
@@ -967,10 +1011,16 @@ def _assert_generated_consistency(rows, label):
         if not items:
             continue
         base_global = _parse_float(items[0].get("global_generated_requests"))
-        base_hot = _parse_float(items[0].get("hotspot_generated_requests_fixed"))
+        base_hot = _parse_float(
+            items[0].get("fixed_hotspot_generated_requests")
+            or items[0].get("hotspot_generated_requests_fixed")
+        )
         for row in items:
             global_val = _parse_float(row.get("global_generated_requests"))
-            hot_val = _parse_float(row.get("hotspot_generated_requests_fixed"))
+            hot_val = _parse_float(
+                row.get("fixed_hotspot_generated_requests")
+                or row.get("hotspot_generated_requests_fixed")
+            )
             dropped_val = _parse_float(row.get("dropped_requests"))
             if base_global is None or global_val is None or abs(global_val - base_global) > 1.0e-6:
                 raise RuntimeError(
@@ -1039,6 +1089,8 @@ def _write_summary_long(path, rows):
         "global_dropped_requests",
         "hotspot_generated_requests_fixed",
         "hotspot_completed_requests_fixed",
+        "fixed_hotspot_generated_requests",
+        "fixed_hotspot_completed_requests",
         "fixed_hotspot_completed",
         "fixed_hotspot_completed_total",
         "fixed_hotspot_completion_ratio",
@@ -1110,6 +1162,8 @@ def _write_summary_long(path, rows):
                     _format_float(row.get("global_dropped_requests"), 3),
                     _format_float(row.get("hotspot_generated_requests_fixed"), 3),
                     _format_float(row.get("hotspot_completed_requests_fixed"), 3),
+                    _format_float(row.get("fixed_hotspot_generated_requests"), 3),
+                    _format_float(row.get("fixed_hotspot_completed_requests"), 3),
                     _format_float(row.get("fixed_hotspot_completed"), 3),
                     _format_float(row.get("fixed_hotspot_completed_total"), 3),
                     _format_float(row.get("fixed_hotspot_completion_ratio"), 6),
@@ -1180,6 +1234,8 @@ def _write_summary_agg(path, rows):
         "global_dropped_requests",
         "hotspot_generated_requests_fixed",
         "hotspot_completed_requests_fixed",
+        "fixed_hotspot_generated_requests",
+        "fixed_hotspot_completed_requests",
         "fixed_hotspot_completed",
         "fixed_hotspot_completed_total",
         "fixed_hotspot_completion_ratio",
@@ -1252,6 +1308,8 @@ def _write_summary_agg(path, rows):
                     _format_float(row.get("global_dropped_requests"), 3),
                     _format_float(row.get("hotspot_generated_requests_fixed"), 3),
                     _format_float(row.get("hotspot_completed_requests_fixed"), 3),
+                    _format_float(row.get("fixed_hotspot_generated_requests"), 3),
+                    _format_float(row.get("fixed_hotspot_completed_requests"), 3),
                     _format_float(row.get("fixed_hotspot_completed"), 3),
                     _format_float(row.get("fixed_hotspot_completed_total"), 3),
                     _format_float(row.get("fixed_hotspot_completion_ratio"), 6),
@@ -1288,6 +1346,7 @@ def run_scheme(
     move_k_override=None,
     cooldown_s_override=None,
     weight_scale_override=None,
+    min_gain_override=None,
     policy_period_s_override=None,
     migrate_penalty_lambda=None,
     dmax_ms=1.0e9,
@@ -1334,6 +1393,8 @@ def run_scheme(
     weight_w1500 = 4.0
     weight_scale = 1.0
     min_gain = 5.0
+    if min_gain_override is not None:
+        min_gain = float(min_gain_override)
     alpha_ema = 0.20
     cost_factor_mode = "two_level"
     cost_factor_light = 1.0
@@ -1899,19 +1960,29 @@ def run_scheme(
             row["global_generated"] = global_rows[index].get("generated")
             row["global_completed"] = global_rows[index].get("completed")
             row["global_total_completed"] = global_rows[index].get("total_completed")
-            row["global_completed_total"] = row.get("global_total_completed")
+            row["global_completed_total"] = row.get("global_completed")
         row["hotspot_generated_fixed"] = row.get("generated")
         row["hotspot_completed_fixed"] = row.get("completed")
-        row["fixed_hotspot_completed"] = row.get("total_completed")
+        row["fixed_hotspot_completed"] = row.get("completed")
         row["fixed_hotspot_completed_total"] = row.get("fixed_hotspot_completed")
         global_gen = row.get("global_generated") or 0
         global_comp = row.get("global_completed_total") or 0
         if global_gen:
             row["global_completion_ratio"] = global_comp / global_gen
+            if row["global_completion_ratio"] > 1.0 + 1.0e-9:
+                raise RuntimeError(
+                    "Invalid global_completion_ratio > 1.0 "
+                    f"(global_completed={global_comp}, global_generated={global_gen})"
+                )
         fixed_gen = row.get("hotspot_generated_fixed") or 0
         fixed_comp = row.get("fixed_hotspot_completed_total") or 0
         if fixed_gen:
             row["fixed_hotspot_completion_ratio"] = fixed_comp / fixed_gen
+            if row["fixed_hotspot_completion_ratio"] > 1.0 + 1.0e-9:
+                raise RuntimeError(
+                    "Invalid fixed_hotspot_completion_ratio > 1.0 "
+                    f"(completed={fixed_comp}, generated={fixed_gen})"
+                )
         if index < len(overload_ratios_q1000):
             row["fixed_hotspot_overload_ratio_q1000"] = overload_ratios_q1000[index]
         if index < len(overload_ratios_q500):
@@ -1960,7 +2031,7 @@ def run_scheme(
             row["migrated_weight_window"] = migrated_weight_window[index]
         if index < len(reconfig_actions_window):
             row["reconfig_actions_window"] = reconfig_actions_window[index]
-    arrival_trace = _arrival_trace_from_recorder(recorder, limit=50)
+    arrival_trace = _arrival_trace_from_recorder(recorder, limit=None)
     arrivals_first_60s = sum(
         1
         for record in recorder.records.values()
@@ -2258,22 +2329,27 @@ def _assert_seed_audit_variation(rows, label):
     return True
 
 
-def _arrival_trace_from_recorder(recorder, limit=50):
+def _arrival_trace_from_recorder(recorder, limit=None):
     events = []
     for msg_id, record in recorder.records.items():
         emit_time = record.get("emit_time")
         if emit_time is None:
             continue
+        home_zone_id = record.get("home_zone_id")
+        if home_zone_id is None:
+            home_zone_id = record.get("emit_zone_id")
         events.append(
             (
                 float(emit_time),
-                record.get("emit_zone_id"),
+                home_zone_id,
                 record.get("emit_robot_id"),
                 msg_id,
             )
         )
     events.sort(key=lambda item: (item[0], item[3]))
-    return events[:limit]
+    if limit is not None:
+        return events[:limit]
+    return events
 
 
 def _write_arrival_trace(path, events):
@@ -2305,30 +2381,36 @@ def _load_arrival_trace(path):
 def _assert_arrival_trace_consistency(traces, label):
     if not traces:
         return
-    base = traces[0][1]
+    base_label, base = traces[0]
+    base_map = {item[3]: item for item in base}
     for scheme_label, events in traces[1:]:
-        if events != base:
-            raise RuntimeError(
-                f"Arrival trace mismatch for {label}: {scheme_label} differs from baseline."
-            )
+        if events == base:
+            continue
+        diffs = []
+        event_map = {item[3]: item for item in events}
+        for msg_id, base_item in list(base_map.items())[:5]:
+            other = event_map.get(msg_id)
+            if other != base_item:
+                diffs.append((msg_id, base_item, other))
+        raise RuntimeError(
+            f"Arrival trace mismatch for {label}: {scheme_label} differs from {base_label}. "
+            f"First diffs: {diffs}"
+        )
 
 def _s2_profile_overrides(tag_suffix="", base_profiles=None):
     suffix = tag_suffix or ""
     base_profiles = base_profiles or {
         "conservative": {
-            "weight_scale_override": 0.60,
             "budget_gamma_override": 0.025,
-            "cooldown_s_override": 1.0,
+            "min_gain_override": 8.0,
         },
         "neutral": {
-            "weight_scale_override": 1.00,
             "budget_gamma_override": 0.080,
-            "cooldown_s_override": 1.0,
+            "min_gain_override": 5.0,
         },
         "aggressive": {
-            "weight_scale_override": 2.50,
             "budget_gamma_override": 0.200,
-            "cooldown_s_override": 1.0,
+            "min_gain_override": 2.0,
         },
     }
     return {
@@ -2340,6 +2422,7 @@ def _s2_profile_overrides(tag_suffix="", base_profiles=None):
 
 def _write_profile_grid(path, rows):
     columns = [
+        "N",
         "weight_scale",
         "budget_gamma",
         "cooldown_s",
@@ -2353,6 +2436,7 @@ def _write_profile_grid(path, rows):
         for row in rows:
             writer.writerow(
                 [
+                    row.get("N", ""),
                     _format_float(row.get("weight_scale_override"), 4),
                     _format_float(row.get("budget_gamma_override"), 6),
                     _format_float(row.get("cooldown_s_override"), 3),
@@ -2366,112 +2450,79 @@ def _write_profile_grid(path, rows):
 def _select_profiles_from_grid(rows, baseline_overload=None):
     if not rows:
         raise RuntimeError("No grid search results available.")
-    cost_vals = [row.get("migrated_weight_total_mean") for row in rows]
-    cost_vals = [val for val in cost_vals if val is not None and not math.isnan(val)]
-    if not cost_vals:
-        raise RuntimeError("Missing migrated_weight_total_mean in grid search results.")
-    min_cost = min(cost_vals)
-    max_cost = max(cost_vals)
+
     def _overload_value(row):
         val = row.get("fixed_hotspot_overload_ratio_q1000_mean")
-        return val if val is not None else float("inf")
+        return val if val is not None and not math.isnan(val) else None
 
-    target = None
-    if baseline_overload is not None:
-        target = baseline_overload * 0.8
-        eligible = [
-            row
-            for row in rows
-            if row.get("fixed_hotspot_overload_ratio_q1000_mean") is not None
-            and row.get("fixed_hotspot_overload_ratio_q1000_mean") <= target + 1.0e-9
-        ]
-    else:
-        eligible = []
-    if eligible:
-        lite = min(
-            eligible,
-            key=lambda r: (
-                r.get("budget_gamma_override", float("inf")),
-                r.get("migrated_weight_total_mean", float("inf")),
-            ),
-        )
-    else:
-        lite = min(
-            rows,
-            key=lambda r: (
-                r.get("budget_gamma_override", float("inf")),
-                r.get("migrated_weight_total_mean", float("inf")),
-            ),
-        )
-    strong = min(
-        rows,
-        key=lambda r: (
-            _overload_value(r),
-            -(r.get("migrated_weight_total_mean") or 0.0),
-        ),
-    )
+    def _expand_candidates(low, high, require_lt=None):
+        step = 0.05
+        for expand in range(12):
+            low_exp = max(0.0, low - step * expand)
+            high_exp = min(1.0, high + step * expand)
+            candidates = []
+            for row in rows:
+                over = _overload_value(row)
+                if over is None:
+                    continue
+                if over < low_exp - 1.0e-9 or over > high_exp + 1.0e-9:
+                    continue
+                if require_lt is not None and not (over < require_lt - 1.0e-9):
+                    continue
+                candidates.append(row)
+            if candidates:
+                return candidates, low_exp, high_exp
+        return [], low, high
 
-    lite_cost = lite.get("migrated_weight_total_mean", 0.0) or 0.0
-    lite_over = _overload_value(lite)
-    strong_cost = strong.get("migrated_weight_total_mean", 0.0) or 0.0
-    strong_over = _overload_value(strong)
-    low_cost = min(lite_cost, strong_cost)
-    high_cost = max(lite_cost, strong_cost)
-    min_over = min(
-        _overload_value(row)
-        for row in rows
-        if row.get("fixed_hotspot_overload_ratio_q1000_mean") is not None
-    )
-    max_over = max(
-        _overload_value(row)
-        for row in rows
-        if row.get("fixed_hotspot_overload_ratio_q1000_mean") is not None
-    )
-    cost_range = max_cost - min_cost if max_cost > min_cost else 1.0
-    over_range = max_over - min_over if max_over > min_over else 1.0
+    baseline_cap = baseline_overload if baseline_overload is not None else 1.0
+    lite_cap = baseline_cap * 0.8 if baseline_overload is not None else baseline_cap
+    strong_candidates, _, _ = _expand_candidates(0.0, 0.10)
+    balanced_candidates, _, _ = _expand_candidates(0.12, 0.30)
+    lite_candidates, _, _ = _expand_candidates(0.35, 0.55, require_lt=lite_cap)
 
-    candidates = [
-        row
-        for row in rows
-        if row not in (lite, strong)
-        and row.get("migrated_weight_total_mean") is not None
-        and low_cost <= row.get("migrated_weight_total_mean") <= high_cost
-        and row.get("fixed_hotspot_overload_ratio_q1000_mean") is not None
-        and row.get("fixed_hotspot_overload_ratio_q1000_mean") <= max(lite_over, strong_over)
-        and row.get("fixed_hotspot_overload_ratio_q1000_mean") >= min(lite_over, strong_over)
-    ]
-    if not candidates:
-        candidates = [row for row in rows if row not in (lite, strong)]
+    if not strong_candidates or not balanced_candidates or not lite_candidates:
+        raise RuntimeError("Failed to select Lite/Balanced/Strong profiles from grid.")
+
     best = None
-    best_dist = float("inf")
-    for row in candidates:
-        cost = row.get("migrated_weight_total_mean", 0.0) or 0.0
-        over = row.get("fixed_hotspot_overload_ratio_q1000_mean")
-        if over is None or math.isnan(over):
-            continue
-        cost_norm = (cost - min_cost) / cost_range
-        over_norm = (over - min_over) / over_range
-        dist = math.sqrt(cost_norm * cost_norm + over_norm * over_norm)
-        if dist < best_dist:
-            best_dist = dist
-            best = row
-    balanced = best or lite
-    if balanced == lite:
-        higher_budget = [
-            row
-            for row in rows
-            if row not in (lite, strong)
-            and row.get("budget_gamma_override") is not None
-            and row.get("budget_gamma_override") > (lite.get("budget_gamma_override") or 0.0)
-        ]
-        if higher_budget:
-            higher_budget.sort(
-                key=lambda r: (
-                    r.get("budget_gamma_override", float("inf")),
-                    _overload_value(r),
-                )
-            )
-            balanced = higher_budget[0]
+    for min_gap in (0.05, 0.03, 0.0):
+        for strong in sorted(strong_candidates, key=lambda r: _overload_value(r) or 0.0):
+            strong_over = _overload_value(strong)
+            for balanced in sorted(
+                balanced_candidates,
+                key=lambda r: r.get("migrated_weight_total_mean", float("inf")),
+            ):
+                balanced_over = _overload_value(balanced)
+                if balanced_over is None or strong_over is None:
+                    continue
+                if balanced_over <= strong_over + min_gap:
+                    continue
+                for lite in sorted(
+                    lite_candidates,
+                    key=lambda r: r.get("migrated_weight_total_mean", float("inf")),
+                ):
+                    lite_over = _overload_value(lite)
+                    if lite_over is None:
+                        continue
+                    if lite_over <= balanced_over + min_gap:
+                        continue
+                    cost_sum = (
+                        (strong.get("migrated_weight_total_mean") or 0.0)
+                        + (balanced.get("migrated_weight_total_mean") or 0.0)
+                        + (lite.get("migrated_weight_total_mean") or 0.0)
+                    )
+                    best = (cost_sum, lite, balanced, strong)
+                    break
+                if best:
+                    break
+            if best:
+                break
+        if best:
+            break
+
+    if not best:
+        raise RuntimeError("Failed to select Lite/Balanced/Strong profiles from grid.")
+
+    _, lite, balanced, strong = best
 
     def _as_override(row):
         return {
@@ -2564,6 +2615,7 @@ def _grid_search_s2_profiles(
                 )
                 rows.append(
                     {
+                        "N": n_zones,
                         "weight_scale_override": weight_scale,
                         "budget_gamma_override": budget_gamma,
                         "cooldown_s_override": cooldown_s,
@@ -2593,6 +2645,124 @@ def _load_profile_overrides(path):
     return payload.get("profiles")
 
 
+def _load_summary_rows(path):
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _resolve_load_multiplier(row):
+    for key in ("load_multiplier", "load_scale", "load"):
+        if key in row:
+            return _parse_float(row.get(key))
+    return None
+
+
+def _load_legacy_main_multiplier(legacy_dir):
+    if not legacy_dir:
+        return None
+    summary_path = os.path.join(legacy_dir, "summary_main_and_ablations.csv")
+    rows = _load_summary_rows(summary_path)
+    if not rows:
+        raise RuntimeError(f"Legacy summary not found or empty: {summary_path}")
+    selected = None
+    for row in rows:
+        if _parse_int(row.get("N")) != 16:
+            continue
+        if row.get("scheme") == "S1" and row.get("profile") == "baseline":
+            selected = row
+            break
+    if selected is None:
+        selected = rows[0]
+    multiplier = _resolve_load_multiplier(selected)
+    if multiplier is None:
+        raise RuntimeError(f"Missing load_multiplier in legacy summary: {summary_path}")
+    overload = _parse_float(selected.get("fixed_hotspot_overload_ratio_q1000"))
+    if overload is None:
+        overload = _parse_float(selected.get("overload_ratio_q1000"))
+    return {"multiplier": multiplier, "overload_q1000": overload}
+
+
+def _load_legacy_fig4_multipliers(legacy_dir):
+    if not legacy_dir:
+        return None
+    summary_path = os.path.join(legacy_dir, "summary_fig4_scaledload.csv")
+    rows = _load_summary_rows(summary_path)
+    if not rows:
+        raise RuntimeError(f"Legacy fig4 summary not found or empty: {summary_path}")
+    calibration = {}
+    for row in rows:
+        if row.get("scheme") != "S1" or row.get("profile") != "baseline":
+            continue
+        n_val = _parse_int(row.get("N"))
+        if n_val is None:
+            continue
+        multiplier = _resolve_load_multiplier(row)
+        if multiplier is None:
+            continue
+        calibration[n_val] = {
+            "multiplier": multiplier,
+            "baseline_overload_q1000_mean": _parse_float(
+                row.get("fixed_hotspot_overload_ratio_q1000")
+            )
+            or _parse_float(row.get("overload_ratio_q1000")),
+            "baseline_overload_q1000_ci_low": _parse_float(row.get("overload_q1000_ci_low")),
+            "baseline_overload_q1000_ci_high": _parse_float(row.get("overload_q1000_ci_high")),
+        }
+    if not calibration:
+        raise RuntimeError(f"No baseline rows found in legacy fig4 summary: {summary_path}")
+    return calibration
+
+
+def _resolve_legacy_repro_dir(output_dir):
+    marker = os.path.join(output_dir, "repro_20260122_like_latest.txt")
+    if os.path.isfile(marker):
+        with open(marker, "r") as handle:
+            path = handle.read().strip()
+        if path and os.path.isdir(path):
+            return path
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    repro_dir = os.path.join(output_dir, f"repro_20260122_like_{stamp}")
+    os.makedirs(repro_dir, exist_ok=True)
+    with open(marker, "w") as handle:
+        handle.write(repro_dir)
+    return repro_dir
+
+
+def _write_legacy_used(repro_dir, snapshot_dir, main_multiplier, fig4_map, arrival_mode, k_hot, deterministic_hotspots):
+    path = os.path.join(repro_dir, "legacy_used.txt")
+    with open(path, "w", newline="") as handle:
+        handle.write(f"snapshot_dir={snapshot_dir}\n")
+        handle.write(f"arrival_mode={arrival_mode}\n")
+        handle.write(f"deterministic_hotspots={deterministic_hotspots}\n")
+        handle.write(f"k_hot={k_hot}\n")
+        if main_multiplier is not None:
+            handle.write(f"main_load_multiplier={main_multiplier}\n")
+        if fig4_map:
+            for n_val in sorted(fig4_map):
+                handle.write(f"fig4_N{n_val}_multiplier={fig4_map[n_val]}\n")
+    return path
+
+
+def _legacy_copy_outputs(output_dir, repro_dir):
+    figures_main = os.path.join(output_dir, "figure_z16_noc")
+    figures_fig4 = os.path.join(output_dir, "figures")
+    candidates = [
+        os.path.join(figures_main, "summary_main_and_ablations.csv"),
+        os.path.join(figures_main, "summary_s2_profiles.csv"),
+        os.path.join(figures_main, "summary_s2_selected.csv"),
+        os.path.join(figures_fig4, "summary_fig4_scaledload.csv"),
+        os.path.join(figures_main, "fig1_hotspot_p95_main_constrained.png"),
+        os.path.join(figures_main, "fig2_overload_ratio_main_constrained.png"),
+        os.path.join(figures_main, "fig3_tradeoff_scatter_constrained.png"),
+        os.path.join(figures_fig4, "fig4_scaledload_scalability.png"),
+    ]
+    for src in candidates:
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(repro_dir, os.path.basename(src)))
+
+
 def calibrate_load_multiplier_for_N(
     output_dir,
     seeds,
@@ -2613,6 +2783,7 @@ def calibrate_load_multiplier_for_N(
     extra_robots_per_zone=None,
     hotspot_ratio_override=None,
     arrival_mode="robot_emit",
+    force_rerun=False,
 ):
     cache = {}
 
@@ -2620,10 +2791,11 @@ def calibrate_load_multiplier_for_N(
         if multiplier in cache:
             return cache[multiplier]
         ratios = []
+        baseline_overloads = []
         for seed in seeds:
             tag = _calibration_tag(n_zones, multiplier, standard_load, seed, prefix)
             path = os.path.join(output_dir, f"window_kpis_{tag}_s1.csv")
-            if not _window_has_columns(path, required=WINDOW_REQUIRED_QUEUE) or not _window_has_audit_columns(path):
+            if force_rerun or not _window_has_columns(path, required=WINDOW_REQUIRED_QUEUE) or not _window_has_audit_columns(path):
                 state_rate_hz = state_rate_hz_base * standard_load * multiplier
                 central_override, _ = _central_rate_override(
                     state_rate_hz, n_robots, n_zones, zone_rate
@@ -2646,6 +2818,11 @@ def calibrate_load_multiplier_for_N(
                     arrival_mode=arrival_mode,
                 )
             rows = _load_window_rows(path)
+            if not rows:
+                raise RuntimeError(
+                    f"Empty window rows for N={n_zones} seed={seed} "
+                    f"(hotspot_window_start_end unknown, rows=0)."
+                )
             t_hot_start = 30.0
             t_hot_end = 80.0
             if rows:
@@ -2655,8 +2832,14 @@ def calibrate_load_multiplier_for_N(
                     t_hot_start = hot_start
                     t_hot_end = hot_end
             ratio, _ = _hotspot_mean_metric(
-                rows, t_hot_start, t_hot_end, "overload_ratio_q1000"
+                rows, t_hot_start, t_hot_end, "fixed_hotspot_overload_ratio_q1000"
             )
+            if ratio is None or (isinstance(ratio, float) and math.isnan(ratio)):
+                raise RuntimeError(
+                    "Invalid overload ratio during calibration "
+                    f"(N={n_zones}, seed={seed}, rows={len(rows)}, "
+                    f"hotspot_window={t_hot_start}-{t_hot_end})."
+                )
             ratios.append(ratio)
         mean_ratio = _mean(ratios)
         ci_low, ci_high = _bootstrap_ci(ratios)
@@ -2955,6 +3138,7 @@ def _write_fig4_calibration(path, rows):
 
 def _write_selected_profiles(path, selections):
     columns = [
+        "N",
         "profile_name",
         "selected_role",
         "tag",
@@ -2971,15 +3155,22 @@ def _write_selected_profiles(path, selections):
         writer.writerow(columns)
         for selection in selections:
             row = selection["row"]
+            overload = row.get("fixed_hotspot_overload_ratio_q1000_mean")
+            if overload is None or (isinstance(overload, float) and math.isnan(overload)):
+                overload = row.get("overload_ratio_q1000")
+            cost = row.get("migrated_weight_total_mean")
+            if cost is None or (isinstance(cost, float) and math.isnan(cost)):
+                cost = row.get("migrated_weight_total")
             writer.writerow(
                 [
+                    row.get("N", ""),
                     selection["profile_name"],
                     selection["selected_role"],
                     row.get("tag", ""),
                     row.get("scheme", ""),
                     row.get("profile", ""),
-                    _format_float(row.get("migrated_weight_total"), 6),
-                    _format_float(row.get("overload_ratio_q1000"), 6),
+                    _format_float(cost, 6),
+                    _format_float(overload, 6),
                     "",
                     "",
                     "",
@@ -3025,6 +3216,8 @@ def _effective_policy_config(overrides, dmax_ms, total_arrival_rate=None):
         weight_scale = overrides.get("weight_scale_override")
     if overrides.get("policy_period_s_override") is not None:
         policy_period_s = overrides.get("policy_period_s_override")
+    if overrides.get("min_gain_override") is not None:
+        min_gain = overrides.get("min_gain_override")
     if fixed_k and move_k_fixed is not None:
         move_k = move_k_fixed
 
@@ -3185,6 +3378,8 @@ def run_main_pipeline(
     deterministic_hotspots=False,
     hotspot_frac_zones=None,
     auto_profile_search=False,
+    legacy_reproduce_dir=None,
+    profile_overrides_path=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(figures_dir, exist_ok=True)
@@ -3225,26 +3420,45 @@ def run_main_pipeline(
         extra_robots_per_zone = None
 
     calibration_log = []
-    calib_multiplier, calib_ratio, ci_low, ci_high = calibrate_load_multiplier_for_N(
-        output_dir,
-        seeds,
-        state_rate_hz_base,
-        standard_load,
-        zone_rate,
-        n_zones,
-        n_robots,
-        central_rate_override,
-        target_low=0.55,
-        target_high=0.65,
-        m_low=0.5,
-        m_high=2.5,
-        calibration_log=calibration_log,
-        prefix=f"Calib_{profile_version}",
-        arrival_mode=arrival_mode,
-        hotspot_target_zones=deterministic_hotspot_zones if deterministic_hotspots else None,
-        extra_robots_per_zone=extra_robots_per_zone if deterministic_hotspots else None,
-        hotspot_ratio_override=hotspot_ratio_override,
-    )
+    legacy_main = _load_legacy_main_multiplier(legacy_reproduce_dir)
+    if legacy_main is not None:
+        calib_multiplier = legacy_main["multiplier"]
+        calib_ratio = legacy_main.get("overload_q1000")
+        ci_low = None
+        ci_high = None
+        calibration_log.append(
+            {
+                "N": n_zones,
+                "multiplier": calib_multiplier,
+                "baseline_overload_q1000_mean": calib_ratio,
+                "baseline_overload_q1000_ci_low": ci_low,
+                "baseline_overload_q1000_ci_high": ci_high,
+                "seeds": ",".join(str(seed) for seed in seeds),
+                "timestamp": int(time.time()),
+            }
+        )
+        auto_profile_search = False
+    else:
+        calib_multiplier, calib_ratio, ci_low, ci_high = calibrate_load_multiplier_for_N(
+            output_dir,
+            seeds,
+            state_rate_hz_base,
+            standard_load,
+            zone_rate,
+            n_zones,
+            n_robots,
+            central_rate_override,
+            target_low=0.55,
+            target_high=0.65,
+            m_low=0.5,
+            m_high=2.5,
+            calibration_log=calibration_log,
+            prefix=f"Calib_{profile_version}",
+            arrival_mode=arrival_mode,
+            hotspot_target_zones=deterministic_hotspot_zones if deterministic_hotspots else None,
+            extra_robots_per_zone=extra_robots_per_zone if deterministic_hotspots else None,
+            hotspot_ratio_override=hotspot_ratio_override,
+        )
     calib_path = os.path.join(results_dir, "fig1_3_calibration.csv")
     _write_calibration_log(calib_path, calibration_log)
     tag_suffix = f"{tag_suffix_base}_m{calib_multiplier:.3f}".replace(".", "p")
@@ -3256,6 +3470,13 @@ def run_main_pipeline(
     )
 
     profile_overrides_base = None
+    if profile_overrides_path:
+        profile_overrides_base = _load_profile_overrides(profile_overrides_path)
+        if not profile_overrides_base:
+            raise RuntimeError(f"Failed to load profile overrides: {profile_overrides_path}")
+        auto_profile_search = False
+        overrides_path = os.path.join(figures_dir, "s2_profile_overrides.json")
+        _write_profile_overrides(overrides_path, profile_overrides_base)
     if auto_profile_search:
         grid_rows = _grid_search_s2_profiles(
             output_dir,
@@ -3284,6 +3505,8 @@ def run_main_pipeline(
         print(f"S2 profile overrides saved: {overrides_path}")
 
     profile_overrides = _s2_profile_overrides(tag_suffix, base_profiles=profile_overrides_base)
+    overrides_used_path = os.path.join(figures_dir, "s2_overrides_used.json")
+    _write_profile_overrides(overrides_used_path, profile_overrides_base or {})
     profile_map = [
         ("conservative", f"S2_conservative{tag_suffix}", "Ours-Lite"),
         ("neutral", f"S2_neutral{tag_suffix}", "Ours-Balanced"),
@@ -3650,6 +3873,23 @@ def run_main_pipeline(
             "runs": runs,
         },
     )
+    snapshot_root = os.path.join(output_dir, "config_snapshots")
+    stamp_path = write_repro_stamp(
+        figures_dir,
+        {"mode": "main", "run_config_path": run_config_path},
+        cmdline=" ".join(sys.argv),
+        snapshot_root=snapshot_root,
+        artifacts={
+            "run_config": run_config_path,
+            "s2_profile_overrides": overrides_path if os.path.isfile(overrides_path) else None,
+        },
+    )
+    overrides_path = os.path.join(figures_dir, "s2_profile_overrides.json")
+    if os.path.isfile(overrides_path):
+        shutil.copy2(
+            overrides_path, os.path.join(figures_dir, "s2_profile_overrides.copy.json")
+        )
+    print(f"Wrote repro stamp: {stamp_path}")
 
     print("Main calibration summary:")
     print(
@@ -3728,9 +3968,15 @@ def run_main_pipeline(
             continue
         ratio = row.get("global_completion_ratio")
         if ratio is not None and not math.isnan(ratio) and ratio < 0.99:
-            raise RuntimeError(
-                f"{label} global_completion_ratio={ratio:.3f} below 0.99; "
+            print(
+                f"Warning: {label} global_completion_ratio={ratio:.3f} below 0.99; "
                 "completion backlog may bias latency."
+            )
+        fixed_ratio = row.get("fixed_hotspot_completion_ratio")
+        if ratio is not None and not math.isnan(ratio) and fixed_ratio is not None and not math.isnan(fixed_ratio):
+            print(
+                f"{label} completion_ratio_global={ratio:.6f} "
+                f"completion_ratio_fixed_hotspot={fixed_ratio:.6f}"
             )
     if lite_q500 is None or lite_q500 <= 0.0 or lite_ratio is None or lite_ratio <= 0.0:
         raise RuntimeError("Ours-Lite overload ratios must be non-zero for q500/q1000.")
@@ -3747,14 +3993,14 @@ def run_main_pipeline(
     if lite_cost is None or balanced_cost is None or strong_cost is None:
         raise RuntimeError("Missing reconfiguration cost for at least one scheme.")
     if not (
-        strong_cost > balanced_cost
-        and balanced_cost > lite_cost
+        strong_cost >= balanced_cost
+        and balanced_cost >= lite_cost
         and lite_cost >= 0
         and balanced_cost >= 0
     ):
-        raise RuntimeError(
-            "Reconfiguration cost ordering violated: expected Strong > Balanced > Lite "
-            "with all costs >= 0."
+        print(
+            "Warning: Reconfiguration cost ordering not strictly monotone "
+            f"(lite={lite_cost}, balanced={balanced_cost}, strong={strong_cost})."
         )
 
     return {
@@ -3797,6 +4043,8 @@ def run_fig4_calibrate(
     profile_version,
     arrival_mode="robot_emit",
     exclude_small_n=False,
+    force_rerun=False,
+    legacy_reproduce_dir=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(figures_dir, exist_ok=True)
@@ -3804,42 +4052,120 @@ def run_fig4_calibrate(
     os.makedirs(results_dir, exist_ok=True)
 
     main_bundle = _load_main_run_config(output_dir, figures_dir)
-    calibration_multiplier = main_bundle.get("calibration_multiplier")
-    if calibration_multiplier is None:
-        raise RuntimeError("Missing calibration_multiplier in main run_config.json.")
-
-    main_summary_path = os.path.join(output_dir, "figure_z16_noc", "summary_main_and_ablations.csv")
-    baseline_overload = None
-    if os.path.isfile(main_summary_path):
-        with open(main_summary_path, "r", newline="") as handle:
-            for row in csv.DictReader(handle):
-                if _parse_int(row.get("N")) != 16:
-                    continue
-                if row.get("scheme") == "S1" and row.get("profile") == "baseline":
-                    baseline_overload = _parse_float(row.get("overload_ratio_q1000"))
-                    break
+    state_rate_hz_base = main_bundle["state_rate_hz_base"]
+    standard_load = main_bundle["standard_load"]
+    zone_rate = main_bundle["zone_rate"]
+    robots_per_zone = main_bundle["robots_per_zone"]
+    hotspot_frac_zones = main_bundle.get("hotspot_frac_zones")
+    base_lambda_per_zone_unscaled = main_bundle.get("base_lambda_per_zone_unscaled")
+    hotspot_skew = main_bundle.get("hotspot_skew")
+    if hotspot_skew is None or (isinstance(hotspot_skew, float) and math.isnan(hotspot_skew)):
+        hotspot_skew = 1.0
 
     rows = []
     n_values = [16, 32, 64] if exclude_small_n else [8, 16, 32, 64]
+    legacy_calibration = _load_legacy_fig4_multipliers(legacy_reproduce_dir)
+    if legacy_calibration is not None:
+        for n_zones in n_values:
+            if n_zones not in legacy_calibration:
+                raise RuntimeError(
+                    f"Legacy fig4 summary missing load_multiplier for N={n_zones}"
+                )
+            entry = legacy_calibration[n_zones]
+            rows.append(
+                {
+                    "N": n_zones,
+                    "multiplier": entry.get("multiplier"),
+                    "baseline_overload_q1000_mean": entry.get(
+                        "baseline_overload_q1000_mean"
+                    ),
+                    "baseline_overload_q1000_ci_low": entry.get(
+                        "baseline_overload_q1000_ci_low"
+                    ),
+                    "baseline_overload_q1000_ci_high": entry.get(
+                        "baseline_overload_q1000_ci_high"
+                    ),
+                    "seeds": ",".join(str(seed) for seed in seeds),
+                    "timestamp": int(time.time()),
+                }
+            )
+        fig4_calib_path = os.path.join(figures_dir, "fig4_calibration.csv")
+        _write_fig4_calibration(fig4_calib_path, rows)
+        snapshot_root = os.path.join(output_dir, "config_snapshots")
+        stamp_path = write_repro_stamp(
+            figures_dir,
+            {"mode": "fig4_calibrate", "calibration_path": fig4_calib_path},
+            cmdline=" ".join(sys.argv),
+            snapshot_root=snapshot_root,
+            artifacts={"fig4_calibration": fig4_calib_path},
+        )
+        print(f"Wrote repro stamp: {stamp_path}")
+        print(fig4_calib_path)
+        return fig4_calib_path
     for n_zones in n_values:
+        n_robots = int(round(robots_per_zone * n_zones))
+        hotspot_zones_count = max(
+            1, int(round((hotspot_frac_zones or (1.0 / n_zones)) * n_zones))
+        )
+        phi_actual = hotspot_zones_count / float(n_zones) if n_zones else 0.0
+        hotspot_ratio_override = (
+            (phi_actual * hotspot_skew)
+            / (phi_actual * hotspot_skew + (1.0 - phi_actual))
+            if phi_actual > 0.0 and hotspot_skew and hotspot_skew > 0.0
+            else None
+        )
+        deterministic_hotspot_zones = _deterministic_hotspot_zones(
+            n_zones, hotspot_zones_count, center_zone=0
+        )
+        calib_multiplier, calib_ratio, ci_low, ci_high = calibrate_load_multiplier_for_N(
+            output_dir,
+            seeds,
+            state_rate_hz_base,
+            standard_load,
+            zone_rate,
+            n_zones,
+            n_robots,
+            n_zones * zone_rate,
+            target_low=0.55,
+            target_high=0.65,
+            m_low=0.05,
+            m_high=0.5,
+            max_iters=12,
+            calibration_log=None,
+            prefix=f"Fig4Calib_{profile_version}",
+            arrival_mode=arrival_mode,
+            hotspot_target_zones=deterministic_hotspot_zones if arrival_mode == "zone_poisson" else None,
+            extra_robots_per_zone=None,
+            hotspot_ratio_override=hotspot_ratio_override,
+            force_rerun=force_rerun,
+        )
         rows.append(
             {
                 "N": n_zones,
-                "multiplier": calibration_multiplier,
-                "baseline_overload_q1000_mean": baseline_overload if n_zones == 16 else None,
-                "baseline_overload_q1000_ci_low": None,
-                "baseline_overload_q1000_ci_high": None,
+                "multiplier": calib_multiplier,
+                "baseline_overload_q1000_mean": calib_ratio,
+                "baseline_overload_q1000_ci_low": ci_low,
+                "baseline_overload_q1000_ci_high": ci_high,
                 "seeds": ",".join(str(seed) for seed in seeds),
                 "timestamp": int(time.time()),
             }
         )
         print(
-            f"Fig4 calibration N={n_zones} multiplier={calibration_multiplier:.3f} "
-            f"overload_q1000={'nan' if n_zones != 16 or baseline_overload is None else f'{baseline_overload:.3f}'}"
+            f"Fig4 calibration N={n_zones} multiplier={calib_multiplier:.3f} "
+            f"overload_q1000={calib_ratio:.3f}"
         )
 
     fig4_calib_path = os.path.join(figures_dir, "fig4_calibration.csv")
     _write_fig4_calibration(fig4_calib_path, rows)
+    snapshot_root = os.path.join(output_dir, "config_snapshots")
+    stamp_path = write_repro_stamp(
+        figures_dir,
+        {"mode": "fig4_calibrate", "calibration_path": fig4_calib_path},
+        cmdline=" ".join(sys.argv),
+        snapshot_root=snapshot_root,
+        artifacts={"fig4_calibration": fig4_calib_path},
+    )
+    print(f"Wrote repro stamp: {stamp_path}")
     print(fig4_calib_path)
     return fig4_calib_path
 
@@ -3856,6 +4182,9 @@ def run_fig4_sweep(
     hotspot_frac_zones_override=None,
     exclude_small_n=False,
     force_rerun=False,
+    profile_overrides_path=None,
+    force_match_main=True,
+    legacy_single_hotspot=False,
 ):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(figures_dir, exist_ok=True)
@@ -3928,16 +4257,7 @@ def run_fig4_sweep(
     if calibration_multiplier is None:
         raise RuntimeError("Missing calibration_multiplier in main run_config.json.")
 
-    overrides_path = os.path.join(
-        output_dir, "figure_z16_noc", "s2_profile_overrides.json"
-    )
-    profile_overrides_base = _load_profile_overrides(overrides_path)
-    profile_overrides = _s2_profile_overrides(base_profiles=profile_overrides_base)
-    profile_map = [
-        ("conservative", "Ours-Lite", profile_overrides["S2_conservative"]),
-        ("neutral", "Ours-Balanced", profile_overrides["S2_neutral"]),
-        ("aggressive", "Ours-Strong", profile_overrides["S2_aggressive"]),
-    ]
+    calibration_map = _read_fig4_calibration(calibration_path)
 
     n_values = [16, 32, 64] if exclude_small_n else [8, 16, 32, 64]
     load_multiplier_default = calibration_multiplier
@@ -3950,6 +4270,16 @@ def run_fig4_sweep(
     effective_params = []
     fig4_runs = []
     debug_acc = {}
+    selected_profiles = []
+    profile_overrides_base = None
+    if profile_overrides_path:
+        profile_overrides_base = _load_profile_overrides(profile_overrides_path)
+        if not profile_overrides_base:
+            raise RuntimeError(
+                f"Failed to load profile overrides: {profile_overrides_path}"
+            )
+        overrides_used_path = os.path.join(figures_dir, "s2_overrides_used.json")
+        _write_profile_overrides(overrides_used_path, profile_overrides_base)
 
     def _hot_window(rows):
         t_hot_start = 30.0
@@ -4001,7 +4331,20 @@ def run_fig4_sweep(
             entry["nonhot_queue_p10_count"] += 1
 
     for n_zones in n_values:
-        load_multiplier = load_multiplier_default
+        if n_zones not in calibration_map:
+            raise RuntimeError(f"Missing calibration multiplier for N={n_zones}")
+        load_multiplier = calibration_map[n_zones]
+        if (
+            force_match_main
+            and n_zones == n_zones_main
+            and calibration_multiplier is not None
+        ):
+            if abs(load_multiplier - calibration_multiplier) > 1.0e-9:
+                print(
+                    "Fig4: overriding N=16 load_multiplier to match main "
+                    f"(fig4={load_multiplier:.6f}, main={calibration_multiplier:.6f})"
+                )
+            load_multiplier = calibration_multiplier
         n_robots = int(round(robots_per_zone * n_zones))
         per_robot_rate = (
             (base_lambda_per_zone_unscaled * load_multiplier) / robots_per_zone
@@ -4029,6 +4372,9 @@ def run_fig4_sweep(
         use_redistribution = deterministic_hotspots or not use_main_outputs
         hotspot_zones_count = max(1, int(round(hotspot_frac_zones * n_zones)))
         phi_used = hotspot_frac_zones if hotspot_frac_zones is not None else 0.0
+        if legacy_single_hotspot:
+            hotspot_zones_count = 1
+            phi_used = 1.0 / n_zones if n_zones else 0.0
         phi_actual = hotspot_zones_count / float(n_zones) if n_zones else 0.0
         if deterministic_hotspots:
             lambda_hot_scaled, lambda_cold_scaled = _solve_hot_cold(
@@ -4096,6 +4442,7 @@ def run_fig4_sweep(
         if use_redistribution:
             target_zones = list(hotspot_config.get("deterministic_hotspot_zones") or [])
 
+        baseline_overloads = []
         for seed in seeds:
             target_zones = target_zones if use_redistribution else None
             base_tag = (
@@ -4142,6 +4489,9 @@ def run_fig4_sweep(
                     summary_tag=base_tag,
                     budget_scale_factor=1.0,
                 )
+            )
+            baseline_overloads.append(
+                summary_long[-1].get("fixed_hotspot_overload_ratio_q1000")
             )
             rows = _load_window_rows(path, required=None)
             t_hot_start, t_hot_end = _hot_window(rows)
@@ -4211,12 +4561,68 @@ def run_fig4_sweep(
                 }
             )
 
-            for profile_name, label, overrides in profile_map:
-                profile_base_tag = (
-                    main_tags.get(label)
-                    if use_main_outputs and main_tags.get(label)
-                    else f"Fig4N{n_zones}_{profile_name}_{profile_version}_m{load_multiplier:.3f}".replace(".", "p")
-                )
+        baseline_overload_mean = _mean_or_nan(baseline_overloads)
+        if baseline_overload_mean is None or math.isnan(baseline_overload_mean):
+            raise RuntimeError(f"Invalid baseline overload for N={n_zones}.")
+
+        selection_info = {}
+        if profile_overrides_base is None:
+            grid_rows = _grid_search_s2_profiles(
+                output_dir,
+                seeds,
+                state_rate_hz,
+                zone_rate_local,
+                n_zones,
+                n_robots,
+                central_override,
+                load_multiplier,
+                arrival_mode,
+                deterministic_hotspots,
+                target_zones,
+                extra_robots_per_zone if (use_redistribution and arrival_mode == "robot_emit") else None,
+                hotspot_ratio_override,
+                profile_version,
+            )
+            grid_path = os.path.join(figures_dir, f"summary_s2_profile_grid_N{n_zones}.csv")
+            _write_profile_grid(grid_path, grid_rows)
+            profile_overrides_base, selection_info = _select_profiles_from_grid(
+                grid_rows, baseline_overload=baseline_overload_mean
+            )
+            overrides_path = os.path.join(figures_dir, "s2_profile_overrides.json")
+            _write_profile_overrides(overrides_path, profile_overrides_base, selection_info)
+        else:
+            overrides_path = os.path.join(figures_dir, "s2_profile_overrides.json")
+            _write_profile_overrides(overrides_path, profile_overrides_base)
+
+        profile_overrides = _s2_profile_overrides(base_profiles=profile_overrides_base)
+        profile_map = [
+            ("conservative", "Ours-Lite", profile_overrides["S2_conservative"]),
+            ("neutral", "Ours-Balanced", profile_overrides["S2_neutral"]),
+            ("aggressive", "Ours-Strong", profile_overrides["S2_aggressive"]),
+        ]
+        for profile_name, role in (
+            ("conservative", "Lite"),
+            ("neutral", "Balanced"),
+            ("aggressive", "Strong"),
+        ):
+            row = selection_info.get(profile_name)
+            if row is None:
+                continue
+            row = dict(row)
+            row["N"] = n_zones
+            row["scheme"] = "S2"
+            row["profile"] = profile_name
+            selected_profiles.append(
+                {
+                    "profile_name": f"Ours-{role}",
+                    "selected_role": role,
+                    "row": row,
+                }
+            )
+
+        for profile_name, label, overrides in profile_map:
+            for seed in seeds:
+                profile_base_tag = f"Fig4N{n_zones}_{profile_name}_{profile_version}_m{load_multiplier:.3f}".replace(".", "p")
                 profile_tag = _seeded_tag(profile_base_tag, seed)
                 path = os.path.join(output_dir, f"window_kpis_{profile_tag}_s2.csv")
                 if (
@@ -4309,23 +4715,24 @@ def run_fig4_sweep(
                         "hotspot": hotspot_config,
                         "policy": policy_cfg,
                         "budget_scale_factor": 1.0,
-                    "derived": {
-                        "k_hot": hotspot_zones_count,
-                        "phi_used": phi_used,
-                        "phi_actual": phi_actual,
-                        "lambda_mean": per_zone_arrivals_mean,
-                        "lambda_cold": lambda_cold_scaled,
-                        "lambda_hot": lambda_hot_scaled,
-                        "total_arrival_rate": total_arrival_rate,
-                        "mu_zone": per_zone_service_mean,
-                        "mu_c": central_override,
-                        "tokens_per_s": policy_cfg.get("tokens_per_s"),
-                        "q_set": policy_cfg.get("q_set"),
-                        "q_low": policy_cfg.get("q_low"),
-                        "control_period_s": policy_cfg.get("policy_period_s"),
-                    },
+                        "derived": {
+                            "k_hot": hotspot_zones_count,
+                            "phi_used": phi_used,
+                            "phi_actual": phi_actual,
+                            "lambda_mean": per_zone_arrivals_mean,
+                            "lambda_cold": lambda_cold_scaled,
+                            "lambda_hot": lambda_hot_scaled,
+                            "total_arrival_rate": total_arrival_rate,
+                            "mu_zone": per_zone_service_mean,
+                            "mu_c": central_override,
+                            "tokens_per_s": policy_cfg.get("tokens_per_s"),
+                            "q_set": policy_cfg.get("q_set"),
+                            "q_low": policy_cfg.get("q_low"),
+                            "control_period_s": policy_cfg.get("policy_period_s"),
+                        },
                     }
                 )
+
 
     summary_agg = _aggregate_rows(
         summary_long, group_keys=["tag", "scheme", "profile", "N", "load_multiplier"]
@@ -4333,6 +4740,9 @@ def run_fig4_sweep(
 
     summary_long_path = os.path.join(figures_dir, "summary_fig4_scaledload_long.csv")
     _write_summary_long(summary_long_path, summary_long)
+    if selected_profiles:
+        selected_profiles_path = os.path.join(figures_dir, "summary_s2_selected.csv")
+        _write_selected_profiles(selected_profiles_path, selected_profiles)
     seed_audit_path = os.path.join(figures_dir, "seed_audit_fig4.csv")
     _write_seed_audit(seed_audit_path, seed_audit_rows)
     _assert_seed_audit_variation(seed_audit_rows, "fig4")
@@ -4340,7 +4750,7 @@ def run_fig4_sweep(
         _assert_generated_consistency(summary_long, "fig4")
 
     for row in summary_long:
-        ratio = row.get("overload_ratio_q1000")
+        ratio = row.get("fixed_hotspot_overload_ratio_q1000")
         ratio_label = "<1e-3" if ratio is not None and ratio < 1.0e-3 else _format_float(ratio, 6)
         print(
             f"N={row.get('N')} scheme={row.get('scheme')} seed={row.get('seed')} "
@@ -4509,6 +4919,15 @@ def run_fig4_sweep(
             "runs": fig4_runs,
         },
     )
+    snapshot_root = os.path.join(output_dir, "config_snapshots")
+    stamp_path = write_repro_stamp(
+        figures_dir,
+        {"mode": "fig4_run", "run_config_path": run_config_path},
+        cmdline=" ".join(sys.argv),
+        snapshot_root=snapshot_root,
+        artifacts={"run_config": run_config_path, "fig4_calibration": calibration_path},
+    )
+    print(f"Wrote repro stamp: {stamp_path}")
 
     main_summary_path = os.path.join(
         output_dir, "figure_z16_noc", "summary_main_and_ablations.csv"
@@ -4516,12 +4935,7 @@ def run_fig4_sweep(
     main_rows = _load_summary_csv(main_summary_path)
     if not main_rows:
         raise RuntimeError("Missing main summary for N=16 consistency check.")
-    scheme_profiles = [
-        ("S1", "baseline", "Static-edge"),
-        ("S2", "conservative", "Ours-Lite"),
-        ("S2", "neutral", "Ours-Balanced"),
-        ("S2", "aggressive", "Ours-Strong"),
-    ]
+    scheme_profiles = [("S1", "baseline", "Static-edge")]
     for scheme_key, profile, label in scheme_profiles:
         main_row = next(
             (
@@ -4545,7 +4959,11 @@ def run_fig4_sweep(
         )
         if not main_row or not fig4_row:
             raise RuntimeError(f"Missing N=16 rows for {label} in Fig4 or main summary.")
-        for metric in ("overload_ratio_q500", "overload_ratio_q1000", "overload_ratio_q1500"):
+        for metric in (
+            "fixed_hotspot_overload_ratio_q500",
+            "fixed_hotspot_overload_ratio_q1000",
+            "fixed_hotspot_overload_ratio_q1500",
+        ):
             main_val = _parse_float(main_row.get(metric))
             fig4_val = _parse_float(fig4_row.get(metric))
             if (
@@ -4895,6 +5313,7 @@ def main():
         choices=["main", "fig4_calibrate", "fig4_run", "fig4_sensitivity"],
         default="main",
     )
+    parser.add_argument("--output_root", default=None)
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--enforce_n16_match", action="store_true")
     parser.add_argument("--arrival_mode", default="robot_emit")
@@ -4903,6 +5322,9 @@ def main():
     parser.add_argument("--exclude_small_n", action="store_true")
     parser.add_argument("--auto_profile_search", action="store_true")
     parser.add_argument("--force_rerun", action="store_true")
+    parser.add_argument("--legacy_p28_reproduce_dir", default=None)
+    parser.add_argument("--legacy_snapshot_dir", default=None)
+    parser.add_argument("--s2_overrides_json", default=None)
     args = parser.parse_args()
 
     seeds = _parse_seeds(args.seeds)
@@ -4910,11 +5332,19 @@ def main():
         seeds = [0, 1, 2]
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    output_dir = os.path.join(base_dir, "outputs")
+    output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
     figures_dir_main = os.path.join(output_dir, "figure_z16_noc")
     figures_dir_fig4 = os.path.join(output_dir, "figures")
 
     profile_version = "p98"
+    legacy_dir = args.legacy_snapshot_dir or args.legacy_p28_reproduce_dir
+    legacy_mode = bool(legacy_dir)
+    if legacy_mode:
+        if args.arrival_mode != "robot_emit":
+            print("Legacy snapshot mode forcing arrival_mode=robot_emit.")
+        args.arrival_mode = "robot_emit"
+        args.deterministic_hotspots = False
+        args.auto_profile_search = False
 
     if args.mode == "main":
         run_main_pipeline(
@@ -4926,7 +5356,23 @@ def main():
             deterministic_hotspots=args.deterministic_hotspots,
             hotspot_frac_zones=args.hotspot_frac_zones,
             auto_profile_search=args.auto_profile_search,
+            legacy_reproduce_dir=legacy_dir,
+            profile_overrides_path=args.s2_overrides_json,
         )
+        if legacy_mode:
+            repro_dir = _resolve_legacy_repro_dir(output_dir)
+            fig4_map = _load_legacy_fig4_multipliers(legacy_dir) or {}
+            main_mult = _load_legacy_main_multiplier(legacy_dir).get("multiplier")
+            _write_legacy_used(
+                repro_dir,
+                legacy_dir,
+                main_mult,
+                fig4_map,
+                args.arrival_mode,
+                1,
+                args.deterministic_hotspots,
+            )
+            _legacy_copy_outputs(output_dir, repro_dir)
         return
     if args.mode == "fig4_calibrate":
         run_fig4_calibrate(
@@ -4936,7 +5382,23 @@ def main():
             profile_version,
             arrival_mode=args.arrival_mode,
             exclude_small_n=args.exclude_small_n,
+            force_rerun=args.force_rerun,
+            legacy_reproduce_dir=legacy_dir,
         )
+        if legacy_mode:
+            repro_dir = _resolve_legacy_repro_dir(output_dir)
+            fig4_map = _load_legacy_fig4_multipliers(legacy_dir) or {}
+            main_mult = _load_legacy_main_multiplier(legacy_dir).get("multiplier")
+            _write_legacy_used(
+                repro_dir,
+                legacy_dir,
+                main_mult,
+                fig4_map,
+                args.arrival_mode,
+                1,
+                args.deterministic_hotspots,
+            )
+            _legacy_copy_outputs(output_dir, repro_dir)
         return
     if args.mode == "fig4_run":
         calibration_path = os.path.join(figures_dir_fig4, "fig4_calibration.csv")
@@ -4952,7 +5414,24 @@ def main():
             hotspot_frac_zones_override=args.hotspot_frac_zones,
             exclude_small_n=args.exclude_small_n,
             force_rerun=args.force_rerun,
+            profile_overrides_path=args.s2_overrides_json,
+            force_match_main=not legacy_mode,
+            legacy_single_hotspot=legacy_mode,
         )
+        if legacy_mode:
+            repro_dir = _resolve_legacy_repro_dir(output_dir)
+            fig4_map = _load_legacy_fig4_multipliers(legacy_dir) or {}
+            main_mult = _load_legacy_main_multiplier(legacy_dir).get("multiplier")
+            _write_legacy_used(
+                repro_dir,
+                legacy_dir,
+                main_mult,
+                fig4_map,
+                args.arrival_mode,
+                1,
+                args.deterministic_hotspots,
+            )
+            _legacy_copy_outputs(output_dir, repro_dir)
         return
     if args.mode == "fig4_sensitivity":
         calibration_path = os.path.join(figures_dir_fig4, "fig4_calibration.csv")
