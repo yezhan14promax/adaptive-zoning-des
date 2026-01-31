@@ -1,4 +1,4 @@
-import os
+﻿import os
 import csv
 import argparse
 
@@ -64,7 +64,7 @@ def main():
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     output_root = normalize_output_root(base_dir, args.output_root, prefix="figure")
-    output_dir = os.path.join(output_root, "figure_z16_noc")
+    output_dir = output_root
     os.makedirs(output_dir, exist_ok=True)
 
     main_config = run_hotspot._load_main_run_config(output_root, output_dir)
@@ -229,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

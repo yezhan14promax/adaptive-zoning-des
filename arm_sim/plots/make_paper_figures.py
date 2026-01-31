@@ -1,5 +1,6 @@
-import argparse
+﻿import argparse
 import csv
+import hashlib
 import math
 import os
 import random
@@ -7,6 +8,7 @@ import shutil
 import time
 
 from arm_sim.experiments.output_utils import normalize_output_root
+from arm_sim.experiments import artifacts
 
 
 SUMMARY_REQUIRED_BASE_COLUMNS = {
@@ -224,6 +226,23 @@ def _load_summary_file(summary_path):
                     item[target_key] = _parse_float(value)
             rows.append(item)
     return rows
+
+
+def _load_csv_loose(path):
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader)
+
+
+def _sha256_file(path, block_size=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(block_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _load_window_rows(path, extra_required=None):
@@ -893,7 +912,9 @@ def _aggregate_scalability(rows, key):
     for row in rows:
         scheme = row["scheme"]
         load_scale = row["load_scale"]
-        n_val = row["N"]
+        n_val = _parse_int(row["N"])
+        if n_val is None:
+            continue
         value = row.get(key)
         if value is None or _is_nan(value):
             continue
@@ -925,34 +946,39 @@ def _aggregate_scalability_simple(rows, key):
     return aggregated
 
 
-def _plot_fig4_scaled_load(fig_path, rows, load_map=None):
+def _plot_fig4_scaled_load(fig_path, rows, load_map=None, selected_map=None):
     import matplotlib.pyplot as plt
 
     schemes = ["Static-edge", "Ours-Lite", "Ours-Balanced", "Ours-Strong"]
     markers = ["o", "s", "D", "^"]
-    n_values = sorted({row["N"] for row in rows})
+    n_values = sorted({int(row["N"]) for row in rows if row.get("N") is not None})
 
     p95_data = _aggregate_scalability_simple(rows, "hotspot_p95_mean_ms")
     overload_data = _aggregate_scalability_simple(rows, "overload_ratio_q1000")
 
     fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.5), constrained_layout=True)
     if load_map:
-        _ = [f"{n}→{load_map[n][0]:.3f}" for n in sorted(load_map.keys())]
+        _ = [f"{n}->{load_map[n][0]:.3f}" for n in sorted(load_map.keys())]
     ax_latency, ax_overload = axes
 
+    plotted = 0
     for scheme, marker in zip(schemes, markers):
         if scheme not in p95_data or scheme not in overload_data:
             continue
         y_means = []
         y_errs = []
+        used = 0
         for n_val in n_values:
             mean, std = p95_data[scheme].get(n_val, (None, None))
             if mean is None:
                 y_means.append(None)
                 y_errs.append(0.0)
                 continue
+            used += 1
             y_means.append(mean / 1000.0)
             y_errs.append(std / 1000.0)
+        if used < 2:
+            continue
         if any(err > 0.0 for err in y_errs):
             ax_latency.errorbar(
                 n_values,
@@ -967,17 +993,22 @@ def _plot_fig4_scaled_load(fig_path, rows, load_map=None):
             ax_latency.plot(
                 n_values, y_means, marker=marker, linewidth=1.5, label=scheme
             )
+        plotted += 1
 
         y_means = []
         y_errs = []
+        used = 0
         for n_val in n_values:
             mean, std = overload_data[scheme].get(n_val, (None, None))
             if mean is None:
                 y_means.append(None)
                 y_errs.append(0.0)
                 continue
+            used += 1
             y_means.append(mean)
             y_errs.append(std)
+        if used < 2:
+            continue
         if any(err > 0.0 for err in y_errs):
             ax_overload.errorbar(
                 n_values,
@@ -992,6 +1023,12 @@ def _plot_fig4_scaled_load(fig_path, rows, load_map=None):
             ax_overload.plot(
                 n_values, y_means, marker=marker, linewidth=1.5, label=scheme
             )
+        plotted += 1
+
+    if plotted == 0:
+        raise RuntimeError(
+            f"Fig4: no series plotted. N values={n_values} rows={len(rows)} selected_map={selected_map}"
+        )
 
     ax_latency.set_xlabel("Number of zones (N)", fontsize=12)
     ax_latency.set_ylabel("Hotspot P95 latency (s)", fontsize=12)
@@ -1015,8 +1052,6 @@ def _plot_fig4_scaled_load(fig_path, rows, load_map=None):
     )
 
     return _save_figure(fig, fig_path)
-
-
 def _plot_fig4_scalability(fig_path, rows):
     import matplotlib.pyplot as plt
 
@@ -1135,7 +1170,7 @@ def _plot_fig4_scalability(fig_path, rows):
             [0],
             color="black",
             linestyle=line_styles.get(scale, "-"),
-            label=f"Load ×{int(scale)}",
+            label=f"Load x{int(scale)}",
         )
         for scale in load_scales
     ]
@@ -1674,46 +1709,8 @@ def _resolve_timestamp_dir(base_dir):
 
 
 def _copy_figures(outputs, base_dir, extra_files=None):
-    pngs = [path for path in outputs if path.lower().endswith(".png")]
-    if not pngs:
-        return None, None
-    timestamp_dir = _resolve_timestamp_dir(base_dir)
-    os.makedirs(timestamp_dir, exist_ok=True)
-    mnt_dir = None
-
-    mapping = {}
-    for path in pngs:
-        name = os.path.basename(path)
-        if name.startswith("fig1_"):
-            mapping["fig1"] = path
-        elif name.startswith("fig2_"):
-            mapping["fig2"] = path
-        elif name.startswith("fig3_"):
-            mapping["fig3"] = path
-        elif name.startswith("fig4_"):
-            mapping["fig4"] = path
-
-    fixed_names = {
-        "fig1": "fig1_hotspot_p95_main_constrained.png",
-        "fig2": "fig2_overload_ratio_main_constrained.png",
-        "fig3": "fig3_tradeoff_scatter_constrained.png",
-        "fig4": "fig4_scaledload_scalability.png",
-    }
-
-    for key, src in mapping.items():
-        dst = os.path.join(timestamp_dir, os.path.basename(src))
-        if os.path.abspath(src) != os.path.abspath(dst):
-            shutil.copy2(src, dst)
-        _ = fixed_names.get(key)
-
-    for path in extra_files or []:
-        if not path or not os.path.isfile(path):
-            continue
-        dst = os.path.join(timestamp_dir, os.path.basename(path))
-        if os.path.abspath(path) != os.path.abspath(dst):
-            shutil.copy2(path, dst)
-
-    return timestamp_dir, mnt_dir
+    # No-op: all outputs must stay in the single output_root directory.
+    return None, None
 
 
 def _plot_from_summaries(output_dir, figures_dir_main, figures_dir_fig4):
@@ -1733,9 +1730,29 @@ def _plot_from_summaries(output_dir, figures_dir_main, figures_dir_fig4):
 
     n_zones = 16
     static_row = _select_profile_row(main_rows, "S1", "baseline", n_zones, summary_main_path)
-    lite_row = _select_profile_row(profile_rows, "S2", "conservative", n_zones, summary_profiles_path)
-    balanced_row = _select_profile_row(profile_rows, "S2", "neutral", n_zones, summary_profiles_path)
-    strong_row = _select_profile_row(profile_rows, "S2", "aggressive", n_zones, summary_profiles_path)
+    selected_path = os.path.join(figures_dir_main, "summary_s2_selected.csv")
+    if not os.path.isfile(selected_path):
+        raise RuntimeError(f"Missing summary_s2_selected.csv: {selected_path}")
+    selected_rows = _load_csv_loose(selected_path)
+    label_to_profile = {}
+    for row in selected_rows:
+        label = row.get("label") or row.get("profile_name") or row.get("selected_role")
+        profile = row.get("profile") or row.get("chosen_profile")
+        if profile and isinstance(profile, str):
+            if "conservative" in profile:
+                profile = "conservative"
+            elif "neutral" in profile:
+                profile = "neutral"
+            elif "aggressive" in profile:
+                profile = "aggressive"
+        if label and profile:
+            label_to_profile[label] = profile
+    lite_profile = label_to_profile.get("Lite") or label_to_profile.get("Ours-Lite") or "conservative"
+    balanced_profile = label_to_profile.get("Balanced") or label_to_profile.get("Ours-Balanced") or "neutral"
+    strong_profile = label_to_profile.get("Strong") or label_to_profile.get("Ours-Strong") or "aggressive"
+    lite_row = _select_profile_row(profile_rows, "S2", lite_profile, n_zones, summary_profiles_path)
+    balanced_row = _select_profile_row(profile_rows, "S2", balanced_profile, n_zones, summary_profiles_path)
+    strong_row = _select_profile_row(profile_rows, "S2", strong_profile, n_zones, summary_profiles_path)
 
     labels_order = ["Static-edge", "Ours-Lite", "Ours-Balanced", "Ours-Strong"]
     values_by_label = {
@@ -1780,32 +1797,48 @@ def _plot_from_summaries(output_dir, figures_dir_main, figures_dir_fig4):
 
     fig4_summary_path = os.path.join(figures_dir_fig4, "summary_fig4_scaledload.csv")
     fig4_rows_raw = _load_summary_file(fig4_summary_path)
+    selected_path = os.path.join(figures_dir_main, "summary_s2_selected.csv")
+    if not os.path.isfile(selected_path):
+        raise RuntimeError(f"Missing summary_s2_selected.csv: {selected_path}")
+    selected_rows = _load_csv_loose(selected_path)
+    selected_map = {}
+    for row in selected_rows:
+        label = row.get("label") or row.get("profile_name") or row.get("selected_role")
+        profile = row.get("profile") or row.get("chosen_profile")
+        if profile and isinstance(profile, str):
+            if "conservative" in profile:
+                profile = "conservative"
+            elif "neutral" in profile:
+                profile = "neutral"
+            elif "aggressive" in profile:
+                profile = "aggressive"
+        if label and profile:
+            if label in ("Lite", "Balanced", "Strong"):
+                label = f"Ours-{label}"
+            if profile not in selected_map:
+                selected_map[profile] = label
     fig4_rows = []
+    if not selected_map:
+        raise RuntimeError("Fig4 mapping requires summary_s2_selected.csv with Lite/Balanced/Strong.")
+
     for row in fig4_rows_raw:
+        label = None
         if row.get("scheme") == "S1" and row.get("profile") == "baseline":
             label = "Static-edge"
-        elif row.get("scheme") == "S2" and row.get("profile") == "conservative":
-            label = "Ours-Lite"
-        elif row.get("scheme") == "S2" and row.get("profile") == "neutral":
-            label = "Ours-Balanced"
-        elif row.get("scheme") == "S2" and row.get("profile") == "aggressive":
-            label = "Ours-Strong"
-        else:
+        elif row.get("scheme") == "S2":
+            label = selected_map.get(row.get("profile"))
+        if not label:
             continue
         fig4_rows.append(
             {
-                "N": row.get("N"),
+                "N": _parse_int(row.get("N")),
                 "scheme": label,
                 "hotspot_p95_mean_ms": row.get("hotspot_p95_mean_ms"),
-                "overload_ratio_q1000": row.get("fixed_hotspot_overload_ratio_q1000"),
+                "overload_ratio_q1000": row.get("overload_ratio_q1000"),
             }
         )
-    expected = {"Static-edge", "Ours-Lite", "Ours-Balanced", "Ours-Strong"}
-    present = {row["scheme"] for row in fig4_rows}
-    if expected - present:
-        raise RuntimeError(f"Fig4 missing schemes: {sorted(expected - present)}")
     fig4_path = os.path.join(figures_dir_fig4, "fig4_scaledload_scalability.png")
-    outputs.extend(_plot_fig4_scaled_load(fig4_path, fig4_rows))
+    outputs.extend(_plot_fig4_scaled_load(fig4_path, fig4_rows, selected_map=selected_map))
     if fig3_offsets:
         print("Fig3 label offsets:")
         for label, offset in fig3_offsets.items():
@@ -1831,9 +1864,9 @@ def main():
     args = _parse_args()
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
-    figures_dir = os.path.join(output_dir, "figure_z16_noc")
+    figures_dir = output_dir
     os.makedirs(figures_dir, exist_ok=True)
-    figures_dir_fig4 = os.path.join(output_dir, "figures")
+    figures_dir_fig4 = output_dir
     os.makedirs(figures_dir_fig4, exist_ok=True)
 
     if args.from_snapshot_dir:
@@ -1853,13 +1886,21 @@ def main():
             handle.write(f"snapshot_dir={snapshot_dir}\n")
             for path in (summary_main_path, summary_fig4_path):
                 stat = os.stat(path)
+                digest = _sha256_file(path)
                 handle.write(
-                    f"{os.path.basename(path)} size={stat.st_size} mtime={int(stat.st_mtime)}\n"
+                    f"{os.path.basename(path)} size={stat.st_size} mtime={int(stat.st_mtime)} sha256={digest}\n"
                 )
         print("Generated outputs from snapshot:")
         for path in outputs:
             print(path)
         print(used_path)
+        artifacts.write_run_config_resolved(
+            output_dir,
+            args=args,
+            derived_dict={"mode": "snapshot_replay", "snapshot_dir": snapshot_dir},
+        )
+        artifacts.write_repro_stamp(output_dir, args=args)
+        artifacts.write_checksums(output_dir)
         return
 
     if args.plot_only:
@@ -1867,11 +1908,16 @@ def main():
         print("Generated outputs:")
         for path in outputs:
             print(path)
+        artifacts.write_run_config_resolved(
+            output_dir, args=args, derived_dict={"mode": "plot_only"}
+        )
+        artifacts.write_repro_stamp(output_dir, args=args)
+        artifacts.write_checksums(output_dir)
         return
 
     seed = 123
     state_rate_hz_base = 10
-    standard_load = 2.0  # standard_load corresponds to the previous load×2 baseline.
+    standard_load = 2.0  # standard_load corresponds to the previous load鑴? baseline.
     zone_rate = 200
     n_zones = 16
     base_n_zones = 8
@@ -1883,7 +1929,7 @@ def main():
     tag_suffix_base = f"_z{n_zones}_std{standard_load:.1f}_{profile_version}"
     hotspot_zone_id = 0
 
-    print("Using N=16 for Fig1–Fig3 main figures.")
+    print("Using N=16 for Fig1閳ユ強ig3 main figures.")
     calib_multiplier, calib_ratio = calibrate_load_multiplier_for_N(
         output_dir,
         seed,
@@ -2366,15 +2412,14 @@ def main():
                 )
 
     fig4_scaled_path = os.path.join(
-        output_dir, "figures", "fig4_scaledload_scalability.png"
+        output_dir, "fig4_scaledload_scalability.png"
     )
-    outputs.extend(_plot_fig4_scaled_load(fig4_scaled_path, fig4_rows, load_map=fig4_loads))
     summary_fig4_path = os.path.join(
-        output_dir, "figures", "summary_fig4_scaledload.csv"
+        output_dir, "summary_fig4_scaledload.csv"
     )
     _write_fig4_scaled_csv(summary_fig4_path, fig4_rows)
     fig4_calibration_path = os.path.join(
-        output_dir, "results", "fig4_calibration.csv"
+        output_dir, "fig4_calibration.csv"
     )
     _write_fig4_calibration_csv(fig4_calibration_path, fig4_calibration_log)
     print(summary_fig4_path)
@@ -2437,3 +2482,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

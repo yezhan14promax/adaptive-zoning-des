@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import argparse
 
@@ -28,7 +28,7 @@ def main():
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
-    figures_dir = os.path.join(output_dir, "figure_z16_noc")
+    figures_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     main_cfg = _load_main_config(figures_dir)
@@ -108,3 +108,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import csv
 import hashlib
 import os
@@ -53,7 +53,7 @@ def main():
     seeds = run_hotspot._parse_seeds(args.seeds)
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
-    figures_dir = os.path.join(output_dir, "figure_z16_noc")
+    figures_dir = output_dir
 
     profile_version = "audit"
     run_hotspot.run_main_pipeline(
@@ -115,3 +115,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import os
 import shutil
@@ -31,8 +31,8 @@ def main():
     manifest = _load_manifest(args.manifest)
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     output_dir = normalize_output_root(base_dir, args.output_root, prefix="figure")
-    figures_dir_main = os.path.join(output_dir, "figure_z16_noc")
-    figures_dir_fig4 = os.path.join(output_dir, "figures")
+    figures_dir_main = output_dir
+    figures_dir_fig4 = output_dir
     repro_dir = _timestamped_dir(os.path.join(output_dir, "reproduced"))
 
     seeds = manifest.get("main", {}).get("seeds") or [0, 1, 2]
@@ -104,3 +104,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

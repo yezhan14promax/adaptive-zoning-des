@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import csv
 import datetime as dt
 import hashlib
@@ -536,7 +536,7 @@ def main():
     scan_paths = [
         os.path.join(repo_root, "outputs", "outputs"),
         os.path.join(repo_root, "outputs"),
-        os.path.join(repo_root, "outputs", "figure_z16_noc"),
+        os.path.join(repo_root, "outputs"),
     ]
     time_window_artifacts = _time_window_scan(scan_paths)
 
@@ -741,3 +741,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
