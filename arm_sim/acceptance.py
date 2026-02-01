@@ -90,7 +90,12 @@ def _check_metric_consistency(summary_main: str, summary_fig4: str) -> Tuple[boo
     return True, ""
 
 
-def _check_required_columns(summary_main: str, summary_fig4: str) -> Tuple[bool, str]:
+def _check_required_columns(
+    summary_main: str,
+    summary_fig4: str,
+    selection_overload_q: int,
+    thresholds: List[int],
+) -> Tuple[bool, str]:
     rows_main = _load_csv(summary_main)
     rows_fig4 = _load_csv(summary_fig4)
     if not rows_main:
@@ -112,6 +117,13 @@ def _check_required_columns(summary_main: str, summary_fig4: str) -> Tuple[bool,
         "overload_q1000",
         "overload_q1500",
     ]
+    if int(selection_overload_q) not in [int(x) for x in thresholds]:
+        return False, f"selection_overload_q={selection_overload_q} not in thresholds={thresholds}"
+    overload_key = f"overload_q{int(selection_overload_q)}"
+    if overload_key not in required_main:
+        required_main.append(overload_key)
+    if overload_key not in required_fig4:
+        required_fig4.append(overload_key)
     missing_main = [c for c in required_main if c not in rows_main[0]]
     missing_fig4 = [c for c in required_fig4 if c not in rows_fig4[0]]
     if missing_main or missing_fig4:
@@ -176,21 +188,30 @@ def _check_manifest_consistency(manifest_path: str, summary_main: str) -> Tuple[
     return True, ""
 
 
-def _check_selection(summary_profiles: str, summary_selected: str, balanced_threshold: float, strong_threshold: float) -> Tuple[bool, str]:
+def _check_selection(
+    summary_profiles: str,
+    summary_selected: str,
+    balanced_threshold: float,
+    strong_threshold: float,
+    selection_overload_q: int,
+) -> Tuple[bool, str]:
     if not os.path.exists(summary_profiles) or not os.path.exists(summary_selected):
         return False, "summary_s2_profiles.csv or summary_s2_selected.csv missing"
-    expected, _ = select_profiles(summary_profiles, balanced_threshold, strong_threshold)
+    expected, _ = select_profiles(summary_profiles, balanced_threshold, strong_threshold, selection_overload_q)
     expected_map = {row["scheme"]: row["profile_id"] for row in expected}
     selected_rows = _load_csv(summary_selected)
     if not selected_rows:
         return False, "summary_s2_selected.csv empty"
+    sel_values = {int(float(r.get("selection_overload_q", selection_overload_q))) for r in selected_rows}
+    if len(sel_values) != 1 or selection_overload_q not in sel_values:
+        return False, f"selection_overload_q mismatch in summary_s2_selected.csv: {sel_values}"
     actual_map = {row["scheme"]: row["profile_id"] for row in selected_rows}
     if expected_map != actual_map:
         return False, f"selected mismatch expected {expected_map} actual {actual_map}"
     return True, ""
 
 
-def _check_fig4_nonempty(summary_fig4: str, fig4_path: str) -> Tuple[bool, str]:
+def _check_fig4_nonempty(summary_fig4: str, fig4_path: str, selection_overload_q: int) -> Tuple[bool, str]:
     if not os.path.exists(summary_fig4):
         return False, "summary_fig4_scaledload.csv missing"
     if not os.path.exists(fig4_path):
@@ -203,10 +224,27 @@ def _check_fig4_nonempty(summary_fig4: str, fig4_path: str) -> Tuple[bool, str]:
     by_scheme = {s: {int(r["N"]) for r in rows if r["scheme"] == s} for s in schemes}
     missing_map = {s: [n for n in Ns if n not in by_scheme[s]] for s in schemes}
     points_map = {s: len(by_scheme[s]) for s in schemes}
-    drawable = [s for s, nset in by_scheme.items() if len(nset) >= 2]
-    if not drawable:
-        return False, f"no drawable curves; Ns={Ns} schemes={schemes} missing={missing_map} points={points_map}"
-    return True, f"points={points_map} missing={missing_map}"
+    drawable_left = [s for s, nset in by_scheme.items() if len(nset) >= 2]
+
+    overload_key = f"overload_q{int(selection_overload_q)}"
+    by_scheme_overload = {
+        s: {int(r["N"]) for r in rows if r["scheme"] == s and r.get(overload_key) not in (None, "")}
+        for s in schemes
+    }
+    missing_overload = {s: [n for n in Ns if n not in by_scheme_overload[s]] for s in schemes}
+    points_overload = {s: len(by_scheme_overload[s]) for s in schemes}
+    drawable_right = [s for s, nset in by_scheme_overload.items() if len(nset) >= 2]
+
+    if not drawable_left or not drawable_right:
+        return False, (
+            f"fig4 drawable check failed; Ns={Ns} schemes={schemes} "
+            f"left_points={points_map} left_missing={missing_map} "
+            f"right_points={points_overload} right_missing={missing_overload}"
+        )
+    return True, (
+        f"left_points={points_map} left_missing={missing_map} "
+        f"right_points={points_overload} right_missing={missing_overload}"
+    )
 
 
 def _check_arrival_hashes(run_params_path: str) -> Tuple[bool, str]:
@@ -293,15 +331,23 @@ def run_acceptance_checks(run_dir: str, emit_debug: bool, balanced_threshold: fl
     run_params_path = os.path.join(run_dir, "run_params.json")
     fig4_path = os.path.join(run_dir, "fig4_scaledload_scalability.png")
     manifest_path = os.path.join(run_dir, "manifest.md")
+    selection_overload_q = 1000
+    thresholds = [500, 1000, 1500]
+    if os.path.exists(run_params_path):
+        with open(run_params_path, encoding="utf-8") as f:
+            params = json.load(f)
+            windowing = params.get("windowing", {})
+            selection_overload_q = int(windowing.get("selection_overload_q", 1000))
+            thresholds = [int(x) for x in windowing.get("queue_overload_thresholds", thresholds)]
 
     checks = [
         ("1) Output dir structure", _check_output_structure(run_dir, emit_debug)),
         ("2) Fairness", _check_fairness(summary_main)),
         ("3) Cohort semantics", _check_cohort(run_params_path, summary_main)),
         ("4) Metric consistency", _check_metric_consistency(summary_main, summary_fig4)),
-        ("5) Required columns", _check_required_columns(summary_main, summary_fig4)),
-        ("6) Selection rules", _check_selection(summary_profiles, summary_selected, balanced_threshold, strong_threshold)),
-        ("7) Fig4 non-empty", _check_fig4_nonempty(summary_fig4, fig4_path)),
+        ("5) Required columns", _check_required_columns(summary_main, summary_fig4, selection_overload_q, thresholds)),
+        ("6) Selection rules", _check_selection(summary_profiles, summary_selected, balanced_threshold, strong_threshold, selection_overload_q)),
+        ("7) Fig4 non-empty", _check_fig4_nonempty(summary_fig4, fig4_path, selection_overload_q)),
         ("8) Decoupling", _check_decoupling(run_params_path)),
         ("9) Manifest consistency", _check_manifest_consistency(manifest_path, summary_main)),
         ("10) Arrival hash consistency", _check_arrival_hashes(run_params_path)),

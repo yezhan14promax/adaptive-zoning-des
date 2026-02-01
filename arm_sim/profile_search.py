@@ -56,7 +56,9 @@ def evaluate_profiles(
     for profile in profiles:
         metrics_accum = {
             "cost": [],
+            "overload_q500": [],
             "overload_q1000": [],
+            "overload_q1500": [],
             "p95_latency_hotspot": [],
             "global_generated": [],
             "fixed_hotspot_generated": [],
@@ -93,7 +95,9 @@ def evaluate_profiles(
                 window_s=config.windowing.window_s,
             )
             metrics_accum["cost"].append(result.cost)
+            metrics_accum["overload_q500"].append(result.overload_q500)
             metrics_accum["overload_q1000"].append(result.overload_q1000)
+            metrics_accum["overload_q1500"].append(result.overload_q1500)
             metrics_accum["p95_latency_hotspot"].append(result.p95_latency_hotspot)
             metrics_accum["global_generated"].append(result.global_generated)
             metrics_accum["fixed_hotspot_generated"].append(result.fixed_hotspot_generated)
@@ -104,7 +108,9 @@ def evaluate_profiles(
             "weight_scale": profile.weight_scale,
             "cooldown_s": profile.cooldown_s,
             "cost": sum(metrics_accum["cost"]) / len(metrics_accum["cost"]),
+            "overload_q500": sum(metrics_accum["overload_q500"]) / len(metrics_accum["overload_q500"]),
             "overload_q1000": sum(metrics_accum["overload_q1000"]) / len(metrics_accum["overload_q1000"]),
+            "overload_q1500": sum(metrics_accum["overload_q1500"]) / len(metrics_accum["overload_q1500"]),
             "p95_latency_hotspot": sum(metrics_accum["p95_latency_hotspot"]) / len(metrics_accum["p95_latency_hotspot"]),
             "global_generated": sum(metrics_accum["global_generated"]) / len(metrics_accum["global_generated"]),
             "fixed_hotspot_generated": sum(metrics_accum["fixed_hotspot_generated"]) / len(metrics_accum["fixed_hotspot_generated"]),

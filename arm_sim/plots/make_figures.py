@@ -104,7 +104,22 @@ def plot_fig4(summary_path: str, output_path: str, selected_path: str | None = N
     if not rows:
         raise ValueError("summary_fig4_scaledload.csv is empty")
 
-    required = ["N", "scheme", "p95_latency_hotspot", "overload_q1000"]
+    if not selected_path or not os.path.exists(selected_path):
+        raise ValueError("Fig4 requires summary_s2_selected.csv for selection_overload_q")
+
+    selected_rows = _load_csv(selected_path)
+    if not selected_rows:
+        raise ValueError("summary_s2_selected.csv is empty (Fig4)")
+    if "selection_overload_q" not in selected_rows[0]:
+        raise ValueError("summary_s2_selected.csv missing selection_overload_q (Fig4)")
+    sel_values = {int(float(r["selection_overload_q"])) for r in selected_rows}
+    if len(sel_values) != 1:
+        raise ValueError(f"selection_overload_q inconsistent in summary_s2_selected.csv: {sel_values}")
+    selection_overload_q = sel_values.pop()
+
+    overload_key = f"overload_q{selection_overload_q}"
+
+    required = ["N", "scheme", "p95_latency_hotspot", overload_key]
     missing_cols = [c for c in required if c not in rows[0]]
     if missing_cols:
         raise ValueError(f"Fig4 missing columns: {missing_cols}")
@@ -115,10 +130,13 @@ def plot_fig4(summary_path: str, output_path: str, selected_path: str | None = N
     for r in rows:
         by_scheme[r["scheme"]][int(r["N"])] = r
 
-    plt.figure(figsize=(6.5, 4.5))
-    plotted = 0
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(11, 4.5))
+    plotted_left = 0
+    plotted_right = 0
     missing_map = {}
     points_map = {}
+    missing_overload = {}
+    points_overload = {}
     for scheme in schemes:
         xs = []
         ys = []
@@ -133,8 +151,25 @@ def plot_fig4(summary_path: str, output_path: str, selected_path: str | None = N
         points_map[scheme] = len(xs)
         if len(xs) < 2:
             continue
-        plt.plot(xs, ys, marker="o", label=scheme)
-        plotted += 1
+        ax_left.plot(xs, ys, marker="o", label=scheme)
+        plotted_left += 1
+
+    for scheme in schemes:
+        xs = []
+        ys = []
+        missing = []
+        for n in Ns:
+            if n in by_scheme[scheme]:
+                xs.append(n)
+                ys.append(float(by_scheme[scheme][n][overload_key]))
+            else:
+                missing.append(n)
+        missing_overload[scheme] = missing
+        points_overload[scheme] = len(xs)
+        if len(xs) < 2:
+            continue
+        ax_right.plot(xs, ys, marker="o", label=scheme)
+        plotted_right += 1
 
     if any(missing_map.values()) or any(count < 2 for count in points_map.values()):
         diagnostics = {
@@ -142,10 +177,12 @@ def plot_fig4(summary_path: str, output_path: str, selected_path: str | None = N
             "schemes present": schemes,
             "missing N per scheme": missing_map,
             "points per scheme": points_map,
+            "missing N per scheme (overload)": missing_overload,
+            "points per scheme (overload)": points_overload,
         }
         print(f"Fig4 diagnostics: {diagnostics}")
 
-    if plotted == 0:
+    if plotted_left == 0 or plotted_right == 0:
         diagnostics = {
             "N values": Ns,
             "schemes present": schemes,
@@ -154,17 +191,26 @@ def plot_fig4(summary_path: str, output_path: str, selected_path: str | None = N
             "missing columns": missing_cols,
             "missing N per scheme": missing_map,
             "points per scheme": points_map,
+            "missing N per scheme (overload)": missing_overload,
+            "points per scheme (overload)": points_overload,
         }
         msg = "Fig4 has no drawable curves. Diagnostics:\n"
         for key, value in diagnostics.items():
             msg += f"{key}: {value}\n"
         raise ValueError(msg)
 
-    plt.xlabel("N (zones)")
-    plt.ylabel("Hotspot p95 latency (s)")
-    plt.title("Fig4: Scaled-load scalability")
-    plt.legend()
-    plt.xticks(Ns, Ns)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
+    ax_left.set_xlabel("N (zones)")
+    ax_left.set_ylabel("Hotspot p95 latency (s)")
+    ax_left.set_title("Fig4: Scaled-load latency")
+    ax_left.legend(fontsize=8)
+    ax_left.set_xticks(Ns, Ns)
+
+    ax_right.set_xlabel("N (zones)")
+    ax_right.set_ylabel(f"Overload ratio (queue > {selection_overload_q})")
+    ax_right.set_title("Fig4: Scaled-load overload")
+    ax_right.legend(fontsize=8)
+    ax_right.set_xticks(Ns, Ns)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)

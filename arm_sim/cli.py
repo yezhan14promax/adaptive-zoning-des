@@ -7,7 +7,7 @@ import sys
 from typing import Dict, List
 
 from .acceptance import run_acceptance_checks
-from .config_schema import ExperimentConfig
+from .config_schema import ExperimentConfig, validate_config
 from .experiment import run_fig4, run_main
 from .output_layout import make_run_dir, write_csv, write_json, write_md
 from .plots.make_figures import plot_fig1, plot_fig2, plot_fig3, plot_fig4
@@ -108,7 +108,12 @@ def _write_manifest(run_dir: str, config: ExperimentConfig, command_line: str | 
     lines.append("- fairness: arrivals fixed per seed and shared across schemes\n")
     lines.append("- cohort_time: arrival_time (no clamp; completion_ratio <= 1)\n")
     lines.append("- overload_ratio_q*: per-second sample in hotspot window, q>threshold averaged over time\n")
-    lines.append("- selection: Lite=min(cost), Balanced=min(cost|overload<=0.3), Strong=min(cost|overload<=0.1)\n\n")
+    lines.append(f"- selection_overload_q: {config.windowing.selection_overload_q}\n")
+    lines.append("- Fig2 shows overload_q500/q1000/q1500 for sensitivity\n")
+    lines.append(
+        "- selection uses overload_q{sel_q} only; Lite=min(cost), Balanced=min(cost|overload<=0.3), "
+        "Strong=min(cost|overload<=0.1)\n\n".format(sel_q=config.windowing.selection_overload_q)
+    )
 
     lines.append("## Main Results (Static-edge vs Lite/Balanced/Strong)\n")
     if rows_main:
@@ -169,7 +174,9 @@ def _write_selection_outputs(run_dir: str, config: ExperimentConfig) -> Dict:
             "weight_scale",
             "cooldown_s",
             "cost",
+            "overload_q500",
             "overload_q1000",
+            "overload_q1500",
             "p95_latency_hotspot",
             "global_generated",
             "fixed_hotspot_generated",
@@ -179,6 +186,7 @@ def _write_selection_outputs(run_dir: str, config: ExperimentConfig) -> Dict:
         os.path.join(run_dir, "summary_s2_profiles.csv"),
         config.selection.balanced_threshold,
         config.selection.strong_threshold,
+        config.windowing.selection_overload_q,
     )
     write_csv(
         os.path.join(run_dir, "summary_s2_selected.csv"),
@@ -190,22 +198,26 @@ def _write_selection_outputs(run_dir: str, config: ExperimentConfig) -> Dict:
             "weight_scale",
             "cooldown_s",
             "cost",
+            "overload_q500",
             "overload_q1000",
+            "overload_q1500",
             "p95_latency_hotspot",
             "global_generated",
             "fixed_hotspot_generated",
+            "selection_overload_q",
         ],
     )
     write_md(os.path.join(run_dir, "selection_report.md"), report)
     return derived_hotspot
 
 
-def _write_main_outputs(run_dir: str, config: ExperimentConfig, emit_debug: bool) -> Dict:
+def _write_main_outputs(run_dir: str, config: ExperimentConfig, emit_debug: bool, progress: bool = False) -> Dict:
     summary_rows, derived_hotspot, arrival_hashes = run_main(
         config,
         selected_profiles_path=os.path.join(run_dir, "summary_s2_selected.csv"),
         emit_debug=emit_debug,
         debug_dir=os.path.join(run_dir, "debug") if emit_debug else None,
+        progress=progress,
     )
     write_csv(
         os.path.join(run_dir, "summary_main_and_ablations.csv"),
@@ -242,10 +254,11 @@ def _write_main_outputs(run_dir: str, config: ExperimentConfig, emit_debug: bool
     return derived_hotspot, arrival_hashes
 
 
-def _write_fig4_outputs(run_dir: str, config: ExperimentConfig) -> Dict:
+def _write_fig4_outputs(run_dir: str, config: ExperimentConfig, progress: bool = False) -> Dict:
     summary_rows, derived_hotspot, arrival_hashes = run_fig4(
         config,
         selected_profiles_path=os.path.join(run_dir, "summary_s2_selected.csv"),
+        progress=progress,
     )
     write_csv(
         os.path.join(run_dir, "summary_fig4_scaledload.csv"),
@@ -353,6 +366,7 @@ def main() -> int:
         if not from_dir:
             raise ValueError("No from_dir provided and no previous figure_ directory found")
         run_dir = make_run_dir(args.output_root)
+        print(f"[plot] output dir: {run_dir}", flush=True)
         _run_plot_only(run_dir, from_dir)
         config = ExperimentConfig()
         source_params = os.path.join(from_dir, "run_params.json")
@@ -364,11 +378,13 @@ def main() -> int:
         _write_manifest(run_dir, config, command_line=" ".join(sys.argv))
         acceptance = run_acceptance_checks(run_dir, emit_debug=False, balanced_threshold=config.selection.balanced_threshold, strong_threshold=config.selection.strong_threshold)
         write_md(os.path.join(run_dir, "acceptance_check.md"), acceptance)
+        print(f"[plot] done. results in {run_dir}", flush=True)
         return 0
 
     if args.cmd == "snapshot_plot":
         os.makedirs(args.output_root, exist_ok=True)
         run_dir = make_run_dir(args.output_root)
+        print(f"[snapshot_plot] output dir: {run_dir}", flush=True)
         replot_from_snapshot(args.snapshot_dir, run_dir)
         for name in [
             "summary_main_and_ablations.csv",
@@ -391,34 +407,44 @@ def main() -> int:
         _write_manifest(run_dir, config, command_line=" ".join(sys.argv))
         acceptance = run_acceptance_checks(run_dir, emit_debug=False, balanced_threshold=config.selection.balanced_threshold, strong_threshold=config.selection.strong_threshold)
         write_md(os.path.join(run_dir, "acceptance_check.md"), acceptance)
+        print(f"[snapshot_plot] done. results in {run_dir}", flush=True)
         return 0
 
     config = _build_config(args)
+    validate_config(config)
     os.makedirs(args.output_root, exist_ok=True)
     run_dir = make_run_dir(args.output_root)
+    print(f"[run] output dir: {run_dir}", flush=True)
     _ensure_debug_dir(run_dir, config.emit_debug_artifacts)
 
     derived_all: Dict = {}
     arrival_hashes_all: Dict = {}
 
     if args.cmd in {"paper_suite", "profile_search", "main", "fig4"}:
+        print("[step A] profile_search + selection", flush=True)
         derived = _write_selection_outputs(run_dir, config)
         _combine_derived(derived_all, {"N{}".format(config.N): {str(k): v for k, v in derived.items()}})
+        print("[step A] done", flush=True)
 
     if args.cmd in {"paper_suite", "main"}:
-        derived, arrival_hashes = _write_main_outputs(run_dir, config, emit_debug=config.emit_debug_artifacts)
+        print("[step B] main experiment", flush=True)
+        derived, arrival_hashes = _write_main_outputs(run_dir, config, emit_debug=config.emit_debug_artifacts, progress=True)
         _combine_derived(derived_all, {"N{}".format(config.N): {str(k): v for k, v in derived.items()}})
         arrival_hashes_all["main"] = {scheme: {str(seed): h for seed, h in seed_map.items()} for scheme, seed_map in arrival_hashes.items()}
+        print("[step B] done", flush=True)
 
     if args.cmd in {"paper_suite", "fig4"}:
-        derived, arrival_hashes = _write_fig4_outputs(run_dir, config)
+        print("[step C] fig4 scalability", flush=True)
+        derived, arrival_hashes = _write_fig4_outputs(run_dir, config, progress=True)
         for n, seed_map in derived.items():
             _combine_derived(derived_all, {"N{}".format(n): {str(k): v for k, v in seed_map.items()}})
         arrival_hashes_all["fig4"] = {
             scheme: {str(n): {str(seed): h for seed, h in seed_map.items()} for n, seed_map in n_map.items()}
             for scheme, n_map in arrival_hashes.items()
         }
+        print("[step C] done", flush=True)
 
+    print("[step D] manifest + acceptance", flush=True)
     _write_run_params(run_dir, config, derived_all, arrival_trace_hashes=arrival_hashes_all)
     _write_manifest(run_dir, config, command_line=" ".join(sys.argv))
 
@@ -429,6 +455,8 @@ def main() -> int:
         strong_threshold=config.selection.strong_threshold,
     )
     write_md(os.path.join(run_dir, "acceptance_check.md"), acceptance)
+    print("[step D] done", flush=True)
+    print(f"[run] completed. results in {run_dir}", flush=True)
     return 0
 
 

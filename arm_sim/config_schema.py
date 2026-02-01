@@ -32,6 +32,7 @@ class WindowingConfig:
     window_s: int = 30
     queue_overload_threshold: int = 1000
     queue_overload_thresholds: List[int] = field(default_factory=lambda: [500, 1000, 1500])
+    selection_overload_q: int = 1000
 
 
 @dataclass
@@ -113,3 +114,12 @@ def compute_hotspot_params(N: int, phi: float, hotspot_skew: float, lambda_mean:
         lambda_cold=lambda_cold,
         hotspot_zones=hotspot_zones,
     )
+
+
+def validate_config(cfg: ExperimentConfig) -> None:
+    thresholds = [int(x) for x in cfg.windowing.queue_overload_thresholds]
+    sel_q = int(cfg.windowing.selection_overload_q)
+    if sel_q not in thresholds:
+        raise ValueError(
+            f"selection_overload_q={sel_q} not in queue_overload_thresholds={thresholds}"
+        )

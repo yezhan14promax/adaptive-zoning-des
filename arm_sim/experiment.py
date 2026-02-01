@@ -63,6 +63,11 @@ def _arrival_trace_hash(arrivals: List[ArrivalRecord]) -> str:
     return digest.hexdigest()
 
 
+def _log(message: str, enabled: bool) -> None:
+    if enabled:
+        print(message, flush=True)
+
+
 def _load_selected_profiles(selected_path: str) -> Dict[str, S2Profile]:
     with open(selected_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -93,6 +98,7 @@ def run_main(
     selected_profiles_path: str,
     emit_debug: bool = False,
     debug_dir: str | None = None,
+    progress: bool = False,
 ) -> Tuple[List[Dict], Dict[int, Dict], Dict[str, Dict[int, str]]]:
     selected_profiles = _load_selected_profiles(selected_profiles_path)
     schemes = [
@@ -122,6 +128,7 @@ def run_main(
         for scheme_name, _ in schemes
     }
 
+    _log(f"[main] start: N={config.N} seeds={config.seeds}", progress)
     for seed in config.seeds:
         derived = compute_hotspot_params(
             N=config.N,
@@ -139,6 +146,7 @@ def run_main(
             "hotspot_zones": derived.hotspot_zones,
         }
 
+        _log(f"[main] seed {seed}: generate arrivals", progress)
         arrival_rng = make_rng_streams(seed).arrival_rng
         arrivals, counts = generate_arrivals(
             arrival_rng,
@@ -155,6 +163,7 @@ def run_main(
         per_scheme_counts: Dict[str, Dict[str, int]] = {}
 
         for scheme_name, policy in schemes:
+            _log(f"[main] seed {seed}: run scheme {scheme_name}", progress)
             rng_streams = make_rng_streams(seed)
             result, debug = simulate(
                 arrivals=arrivals,
@@ -227,12 +236,14 @@ def run_main(
             }
         )
 
+    _log("[main] done", progress)
     return summary_rows, derived_hotspot, arrival_hashes
 
 
 def run_fig4(
     config: ExperimentConfig,
     selected_profiles_path: str,
+    progress: bool = False,
 ) -> Tuple[List[Dict], Dict[int, Dict], Dict[str, Dict[int, Dict[int, str]]]]:
     selected_profiles = _load_selected_profiles(selected_profiles_path)
     schemes = [
@@ -246,7 +257,9 @@ def run_fig4(
     derived_hotspot: Dict[int, Dict] = {}
     arrival_hashes: Dict[str, Dict[int, Dict[int, str]]] = {scheme: {} for scheme, _ in schemes}
 
+    _log(f"[fig4] start: Ns={config.scale_Ns} seeds={config.seeds}", progress)
     for N in config.scale_Ns:
+        _log(f"[fig4] N={N}: prepare", progress)
         for seed in config.seeds:
             derived = compute_hotspot_params(
                 N=N,
@@ -266,6 +279,7 @@ def run_fig4(
 
         arrivals_by_seed: Dict[int, Tuple[List[ArrivalRecord], Dict[str, int], str]] = {}
         for seed in config.seeds:
+            _log(f"[fig4] N={N} seed {seed}: generate arrivals", progress)
             derived = derived_hotspot[N][seed]
             arrival_rng = make_rng_streams(seed).arrival_rng
             arrivals, counts = generate_arrivals(
@@ -283,6 +297,7 @@ def run_fig4(
         counts_by_seed: Dict[int, Dict[str, Dict[str, int]]] = {seed: {} for seed in config.seeds}
 
         for scheme_name, policy_factory in schemes:
+            _log(f"[fig4] N={N}: run scheme {scheme_name}", progress)
             metrics_accum = {
                 "cost": [],
                 "overload_q500": [],
@@ -293,6 +308,7 @@ def run_fig4(
                 "fixed_hotspot_generated": [],
             }
             for seed in config.seeds:
+                _log(f"[fig4] N={N} seed {seed}: scheme {scheme_name}", progress)
                 derived = derived_hotspot[N][seed]
                 arrivals, counts, arrival_hash = arrivals_by_seed[seed]
                 rng_streams = make_rng_streams(seed)
@@ -348,4 +364,5 @@ def run_fig4(
             if len(global_vals) > 1 or len(hotspot_vals) > 1:
                 raise ValueError(f"Fairness violation N={N} seed={seed}: {scheme_counts}")
 
+    _log("[fig4] done", progress)
     return summary_rows, derived_hotspot, arrival_hashes
